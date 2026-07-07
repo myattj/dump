@@ -31,8 +31,8 @@
 	<key>SUEnableInstallerLauncherService</key>
 	<true/>
 	<key>SUFeedURL</key>
-	<string>https://updates.dump.example/appcast.xml</string>
+	<string>https://myattj.github.io/dump-updates/appcast.xml</string>
 	<key>SUPublicEDKey</key>
-	<string>REPLACE_WITH_SPARKLE_ED25519_PUBLIC_KEY</string>
+	<string>CSXW1L8m4x/hSs0Bh7OuArx/DnL3UWh6245lvVkhvZ4=</string>
 </dict>
 </plist>

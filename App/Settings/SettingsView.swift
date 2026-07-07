@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Carbon.HIToolbox
 
 @MainActor
 public final class SettingsWindowController {
@@ -35,7 +36,7 @@ struct SettingsView: View {
 
     var body: some View {
         TabView {
-            GeneralSettingsView(storage: coordinator.storage)
+            GeneralSettingsView(storage: coordinator.storage, hotkeys: coordinator.hotkeyPreferences)
                 .tabItem { Label("General", systemImage: "gearshape") }
             ClassifierSettingsView(hub: coordinator.classifierHub)
                 .tabItem { Label("Classifier", systemImage: "brain") }
@@ -51,7 +52,10 @@ struct SettingsView: View {
 
 struct GeneralSettingsView: View {
     let storage: StoragePreference
+    @ObservedObject var hotkeys: HotkeyPreferenceStore
     @State private var path: String = ""
+    @State private var recordingAction: HotkeyManager.Action?
+    @State private var hotkeyMessage: String?
 
     var body: some View {
         Form {
@@ -69,11 +73,87 @@ struct GeneralSettingsView: View {
                 }
             }
             Section("Hotkeys") {
-                Text("Capture: ⇧⌘D · Query: ⇧⌘F")
-                    .foregroundStyle(.secondary)
+                ForEach(HotkeyManager.Action.configurableActions) { action in
+                    hotkeyRow(for: action)
+                }
+                if let hotkeyMessage {
+                    Text(hotkeyMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .onAppear { path = storage.root.path }
+    }
+
+    private func hotkeyRow(for action: HotkeyManager.Action) -> some View {
+        HStack {
+            Text(action.title)
+            Spacer()
+            Button {
+                recordingAction = action
+                hotkeyMessage = nil
+            } label: {
+                Text(hotkeyTitle(for: action))
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minWidth: 96)
+            }
+            .background(
+                HotkeyCaptureView(
+                    isActive: recordingAction == action,
+                    onKeyDown: { event in record(event, for: action) },
+                    onCancel: {
+                        recordingAction = nil
+                        hotkeyMessage = nil
+                    }
+                )
+                .frame(width: 0, height: 0)
+            )
+            Button("Clear") {
+                hotkeys.disable(action)
+                if recordingAction == action { recordingAction = nil }
+                hotkeyMessage = nil
+            }
+            Button("Reset") {
+                hotkeys.reset(action)
+                if recordingAction == action { recordingAction = nil }
+                hotkeyMessage = nil
+            }
+            .disabled(!hotkeys.hasCustomValue(for: action))
+        }
+    }
+
+    private func hotkeyTitle(for action: HotkeyManager.Action) -> String {
+        if recordingAction == action { return "Press keys" }
+        return hotkeys.binding(for: action)?.displayString ?? "Off"
+    }
+
+    private func record(_ event: NSEvent, for action: HotkeyManager.Action) {
+        let supportedModifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let isBareDelete = supportedModifiers.isEmpty
+            && (event.keyCode == UInt16(kVK_Delete) || event.keyCode == UInt16(kVK_ForwardDelete))
+        if isBareDelete {
+            hotkeys.disable(action)
+            recordingAction = nil
+            hotkeyMessage = nil
+            return
+        }
+
+        guard let binding = HotkeyManager.Binding(event: event) else {
+            NSSound.beep()
+            hotkeyMessage = "Use a modifier plus a key, or a function key."
+            return
+        }
+
+        if let conflict = hotkeys.conflictingAction(for: binding, excluding: action) {
+            NSSound.beep()
+            hotkeyMessage = "\(binding.displayString) is already used for \(conflict.title)."
+            return
+        }
+
+        hotkeys.set(binding, for: action)
+        recordingAction = nil
+        hotkeyMessage = nil
     }
 
     private func pickFolder() {
@@ -84,6 +164,54 @@ struct GeneralSettingsView: View {
         if panel.runModal() == .OK, let url = panel.url {
             storage.setRoot(url)
             path = url.path
+        }
+    }
+}
+
+private struct HotkeyCaptureView: NSViewRepresentable {
+    let isActive: Bool
+    let onKeyDown: (NSEvent) -> Void
+    let onCancel: () -> Void
+
+    func makeNSView(context: Context) -> KeyCaptureNSView {
+        let view = KeyCaptureNSView()
+        view.onKeyDown = onKeyDown
+        view.onCancel = onCancel
+        return view
+    }
+
+    func updateNSView(_ nsView: KeyCaptureNSView, context: Context) {
+        nsView.onKeyDown = onKeyDown
+        nsView.onCancel = onCancel
+        if isActive {
+            DispatchQueue.main.async {
+                nsView.window?.makeFirstResponder(nsView)
+            }
+        } else if nsView.window?.firstResponder === nsView {
+            DispatchQueue.main.async {
+                nsView.window?.makeFirstResponder(nil)
+            }
+        }
+    }
+
+    final class KeyCaptureNSView: NSView {
+        var onKeyDown: ((NSEvent) -> Void)?
+        var onCancel: (() -> Void)?
+
+        override var acceptsFirstResponder: Bool { true }
+
+        override func keyDown(with event: NSEvent) {
+            if event.keyCode == UInt16(kVK_Escape) {
+                onCancel?()
+                return
+            }
+            onKeyDown?(event)
+        }
+
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            guard event.type == .keyDown else { return false }
+            keyDown(with: event)
+            return true
         }
     }
 }
@@ -105,9 +233,27 @@ struct ClassifierSettingsView: View {
     @State private var bedrockAccessKeyID: String = ""
     @State private var bedrockSecretAccessKey: String = ""
     @State private var bedrockSessionToken: String = ""
-    @State private var savedFlash: String?
+    @State private var savedFlash: FlashMessage?
+    @State private var flashTask: Task<Void, Never>?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private struct FlashMessage: Equatable {
+        let text: String
+        let isSuccess: Bool
+    }
 
     private let configStore = CustomLLMConfigStore.shared
+
+    /// Mode sections drift up as they arrive; the outgoing one just fades.
+    private var modeSectionTransition: AnyTransition {
+        reducedTransition(
+            .asymmetric(
+                insertion: .opacity.combined(with: .offset(y: 6)),
+                removal: .opacity
+            ),
+            reduceMotion: reduceMotion
+        )
+    }
 
     var body: some View {
         Form {
@@ -122,6 +268,7 @@ struct ClassifierSettingsView: View {
             }
 
             if mode == .cloud {
+                Group {
                 Section("Anthropic API key") {
                     LabeledContent("API key") {
                         SecureField("Anthropic API key", text: $apiKey)
@@ -153,7 +300,10 @@ struct ClassifierSettingsView: View {
                         flash("Saved")
                     }
                 }
+                }
+                .transition(modeSectionTransition)
             } else if mode == .local {
+                Group {
                 Section("Ollama") {
                     LabeledContent("Base URL") {
                         TextField("Base URL", text: $ollamaBaseURL)
@@ -173,7 +323,10 @@ struct ClassifierSettingsView: View {
                         flash("Saved")
                     }
                 }
+                }
+                .transition(modeSectionTransition)
             } else if mode == .custom {
+                Group {
                 Section("OpenAI-compatible HTTPS endpoint") {
                     HStack {
                         Button("Connect OpenAI") {
@@ -213,8 +366,19 @@ struct ClassifierSettingsView: View {
                         flash("Saved")
                     }
                 }
+                }
+                .transition(modeSectionTransition)
             } else if mode == .bedrock {
+                Group {
                 Section("Amazon Bedrock Runtime") {
+                    HStack {
+                        Button("Open model access") {
+                            open(ProviderConnect.bedrockModelAccessURL)
+                        }
+                        Button("Use Bedrock defaults") {
+                            configureBedrockDefaults()
+                        }
+                    }
                     LabeledContent("Region") {
                         TextField("Region", text: $bedrockRegion)
                             .labelsHidden()
@@ -249,22 +413,34 @@ struct ClassifierSettingsView: View {
                     }
                     Text("Credentials are stored in Keychain and used only to sign Bedrock Runtime requests.")
                         .font(.caption).foregroundStyle(.secondary)
-                    Button("Save AWS credentials") {
-                        configStore.bedrockRegion = bedrockRegion
-                        configStore.bedrockClassifierModelID = bedrockClassifierModelID
-                        configStore.bedrockSynthesizerModelID = bedrockSynthesizerModelID
-                        try? KeychainStore.shared.set(bedrockAccessKeyID, for: .bedrockAccessKeyID)
-                        try? KeychainStore.shared.set(bedrockSecretAccessKey, for: .bedrockSecretAccessKey)
-                        try? KeychainStore.shared.set(bedrockSessionToken, for: .bedrockSessionToken)
-                        flash("Saved")
+                    HStack {
+                        Button("Use AWS env vars") {
+                            importBedrockEnvironmentCredentials()
+                        }
+                        Button("Save AWS credentials") {
+                            persistBedrockSettings()
+                            flash("Saved")
+                        }
                     }
                 }
+                }
+                .transition(modeSectionTransition)
             }
 
             if let savedFlash {
-                Text(savedFlash).font(.caption).foregroundStyle(.secondary)
+                Label(savedFlash.text, systemImage: savedFlash.isSuccess ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(savedFlash.isSuccess ? Color.green : Color.orange)
+                    .transition(reducedTransition(
+                        .asymmetric(
+                            insertion: .scale(scale: 0.9, anchor: .leading).combined(with: .opacity),
+                            removal: .opacity
+                        ),
+                        reduceMotion: reduceMotion
+                    ))
             }
         }
+        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: mode)
         .task {
             self.mode = await hub.mode
             self.apiKey = KeychainStore.shared.string(for: .anthropicAPIKey) ?? ""
@@ -275,20 +451,29 @@ struct ClassifierSettingsView: View {
             self.customAPIKey = KeychainStore.shared.string(for: .customLLMAPIKey) ?? ""
             self.ollamaBaseURL = configStore.ollamaBaseURL
             self.ollamaModel = configStore.ollamaModel
-            self.bedrockRegion = configStore.bedrockRegion
-            self.bedrockClassifierModelID = configStore.bedrockClassifierModelID
-            self.bedrockSynthesizerModelID = configStore.bedrockSynthesizerModelID
+            self.bedrockRegion = configStore.bedrockRegion.isEmpty ? ProviderConnect.bedrockRegion : configStore.bedrockRegion
+            self.bedrockClassifierModelID = configStore.bedrockClassifierModelID.isEmpty ? ProviderConnect.bedrockClassifierModelID : configStore.bedrockClassifierModelID
+            self.bedrockSynthesizerModelID = configStore.bedrockSynthesizerModelID.isEmpty ? ProviderConnect.bedrockSynthesizerModelID : configStore.bedrockSynthesizerModelID
             self.bedrockAccessKeyID = KeychainStore.shared.string(for: .bedrockAccessKeyID) ?? ""
             self.bedrockSecretAccessKey = KeychainStore.shared.string(for: .bedrockSecretAccessKey) ?? ""
             self.bedrockSessionToken = KeychainStore.shared.string(for: .bedrockSessionToken) ?? ""
         }
     }
 
-    private func flash(_ msg: String) {
-        savedFlash = msg
-        Task {
+    /// Confirmation flash with a proper lifecycle: springs in, cancels any
+    /// previous countdown (repeated saves retarget instead of racing), and
+    /// fades out after 1.5s.
+    private func flash(_ msg: String, success: Bool = true) {
+        flashTask?.cancel()
+        withAnimation(resolved(Motion.bouncy, reduceMotion: reduceMotion)) {
+            savedFlash = FlashMessage(text: msg, isSuccess: success)
+        }
+        flashTask = Task {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
-            await MainActor.run { savedFlash = nil }
+            guard !Task.isCancelled else { return }
+            withAnimation(resolved(Motion.exit, reduceMotion: reduceMotion)) {
+                savedFlash = nil
+            }
         }
     }
 
@@ -298,7 +483,7 @@ struct ClassifierSettingsView: View {
 
     private func importAnthropicEnvironmentKey() {
         guard let key = ProviderConnect.environmentValue(for: .anthropic) else {
-            flash("No ANTHROPIC_API_KEY found")
+            flash("No ANTHROPIC_API_KEY found", success: false)
             return
         }
         apiKey = key
@@ -320,13 +505,64 @@ struct ClassifierSettingsView: View {
 
     private func importOpenAIEnvironmentKey() {
         guard let key = ProviderConnect.environmentValue(for: .openAI) else {
-            flash("No OPENAI_API_KEY found")
+            flash("No OPENAI_API_KEY found", success: false)
             return
         }
         customAPIKey = key
         configureOpenAIDefaults()
         try? KeychainStore.shared.set(key, for: .customLLMAPIKey)
         flash("Imported OPENAI_API_KEY")
+    }
+
+    private func configureBedrockDefaults() {
+        bedrockRegion = ProviderConnect.bedrockRegion
+        bedrockClassifierModelID = ProviderConnect.bedrockClassifierModelID
+        bedrockSynthesizerModelID = ProviderConnect.bedrockSynthesizerModelID
+        persistBedrockSettings()
+        flash("Bedrock defaults set")
+    }
+
+    private func importBedrockEnvironmentCredentials() {
+        var didImport = false
+        let region = ProviderConnect.environmentValue(for: .awsRegion)
+            ?? ProviderConnect.environmentValue(for: .awsDefaultRegion)
+        if let region {
+            bedrockRegion = region
+            didImport = true
+        }
+        if let accessKeyID = ProviderConnect.environmentValue(for: .awsAccessKeyID) {
+            bedrockAccessKeyID = accessKeyID
+            didImport = true
+        }
+        if let secretAccessKey = ProviderConnect.environmentValue(for: .awsSecretAccessKey) {
+            bedrockSecretAccessKey = secretAccessKey
+            didImport = true
+        }
+        if let sessionToken = ProviderConnect.environmentValue(for: .awsSessionToken) {
+            bedrockSessionToken = sessionToken
+            didImport = true
+        }
+        guard didImport else {
+            flash("No AWS env vars found", success: false)
+            return
+        }
+        persistBedrockSettings()
+        flash("Imported AWS env vars")
+    }
+
+    private func persistBedrockSettings() {
+        let synthesizerModelID: String
+        if bedrockSynthesizerModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            synthesizerModelID = bedrockClassifierModelID
+        } else {
+            synthesizerModelID = bedrockSynthesizerModelID
+        }
+        configStore.bedrockRegion = bedrockRegion
+        configStore.bedrockClassifierModelID = bedrockClassifierModelID
+        configStore.bedrockSynthesizerModelID = synthesizerModelID
+        try? KeychainStore.shared.set(bedrockAccessKeyID, for: .bedrockAccessKeyID)
+        try? KeychainStore.shared.set(bedrockSecretAccessKey, for: .bedrockSecretAccessKey)
+        try? KeychainStore.shared.set(bedrockSessionToken, for: .bedrockSessionToken)
     }
 
     private func persistOpenAICompatibleSettings() {

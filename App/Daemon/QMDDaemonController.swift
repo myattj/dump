@@ -56,7 +56,10 @@ public actor QMDDaemonController {
     }
 
     public func currentState() -> State { state }
-    public func currentPort() -> Int? { port }
+    public func currentPort() -> Int? {
+        guard case .running(let port) = state else { return nil }
+        return port
+    }
     public func recentLog(limit: Int = 50) -> [String] { Array(ringBuffer.suffix(limit)) }
 
     /// Bundled `node` binary. Used by the CLI runner that backs qmd's
@@ -82,6 +85,11 @@ public actor QMDDaemonController {
         state = .starting
         let chosen = pickPort()
         port = chosen
+        DiagnosticLog.event(.info, category: "qmd", "starting daemon", metadata: [
+            "port": String(chosen),
+            "runtime": (config.runtimeDirectory ?? bundledRuntimeDirectory()).path,
+            "data_dir": StoragePreference.shared.root.path,
+        ])
         let env = [
             "QMD_PORT": String(chosen),
             "QMD_DATA_DIR": StoragePreference.shared.root.path,
@@ -102,13 +110,24 @@ public actor QMDDaemonController {
             state = .running(port: chosen)
             restartAttempts = 0
             log.info("qmd up on \(chosen, privacy: .public)")
+            DiagnosticLog.event(.info, category: "qmd", "daemon healthy", metadata: [
+                "port": String(chosen),
+            ])
         } catch {
             state = .crashed(reason: String(describing: error))
+            port = nil
             log.error("qmd start failed: \(String(describing: error), privacy: .public)")
+            DiagnosticLog.event(.error, category: "qmd", "daemon start failed", metadata: [
+                "port": String(chosen),
+                "error": String(describing: error),
+            ])
         }
     }
 
     public func stop() async {
+        DiagnosticLog.event(.info, category: "qmd", "stopping daemon", metadata: [
+            "port": port.map(String.init) ?? "",
+        ])
         process.terminate()
         state = .stopped
         port = nil
@@ -142,19 +161,29 @@ public actor QMDDaemonController {
     private func handleExit(code: Int32) async {
         if state == .stopped { return }
         ringBuffer.append("[exit] code=\(code)")
+        DiagnosticLog.event(.warning, category: "qmd", "daemon exited", metadata: [
+            "code": String(code),
+            "restart_attempt": String(restartAttempts + 1),
+        ])
         restartAttempts += 1
         if restartAttempts <= config.maxRestartAttempts {
             log.warning("qmd exited (\(code)), restart \(self.restartAttempts)/\(self.config.maxRestartAttempts)")
             await start()
         } else {
             state = .crashed(reason: "exited with \(code) after \(restartAttempts) restart attempts")
+            port = nil
             log.error("qmd gave up after \(self.restartAttempts) restart attempts")
+            DiagnosticLog.event(.error, category: "qmd", "daemon restart limit reached", metadata: [
+                "code": String(code),
+                "restart_attempts": String(restartAttempts),
+            ])
         }
     }
 
     private func appendLog(_ line: String) {
         ringBuffer.append(line)
         if ringBuffer.count > 500 { ringBuffer.removeFirst(ringBuffer.count - 500) }
+        DiagnosticLog.event(.debug, category: "qmd.process", line)
     }
 
     private func reapOrphans() async {

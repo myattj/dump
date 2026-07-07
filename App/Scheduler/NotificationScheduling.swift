@@ -1,6 +1,15 @@
 import Foundation
 import UserNotifications
 
+/// Identifiers shared between the scheduling adapter (which stamps the
+/// category on outgoing notifications) and `NotificationRouter` (which
+/// registers the category's actions and handles responses).
+public enum QueueNotification {
+    public static let category = "dump.queue.item"
+    public static let doneAction = "dump.action.done"
+    public static let snoozeAction = "dump.action.snooze1h"
+}
+
 /// Abstraction over `UNUserNotificationCenter` so tests can verify what was
 /// scheduled without hitting the real notification subsystem.
 public protocol NotificationScheduling: Sendable {
@@ -14,8 +23,21 @@ public struct UserNotificationCenterAdapter: NotificationScheduling {
     public init() {}
 
     public func requestAuthorizationIfNeeded() async -> Bool {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral:
+            return true
+        case .denied:
+            return false
+        case .notDetermined:
+            break
+        @unknown default:
+            return false
+        }
+
         do {
-            return try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])
+            return try await center.requestAuthorization(options: [.alert, .sound, .badge])
         } catch {
             return false
         }
@@ -27,11 +49,18 @@ public struct UserNotificationCenterAdapter: NotificationScheduling {
         content.body = body
         content.sound = .default
         content.userInfo = userInfo
+        content.categoryIdentifier = QueueNotification.category
 
+        // Calendar triggers key on wall-clock time, so a Mac that was asleep
+        // at the fire time delivers on wake — interval triggers pause while
+        // asleep and drift by the sleep duration.
         let trigger: UNNotificationTrigger
-        let interval = fireAt.timeIntervalSinceNow
-        if interval > 0 {
-            trigger = UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
+        if fireAt.timeIntervalSinceNow > 1 {
+            let components = Calendar.current.dateComponents(
+                [.year, .month, .day, .hour, .minute, .second],
+                from: fireAt
+            )
+            trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
         } else {
             trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
         }

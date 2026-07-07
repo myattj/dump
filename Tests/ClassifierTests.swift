@@ -16,6 +16,7 @@ final class ClaudeClassifierTests: XCTestCase {
                     "scheduled_at": "2026-05-16T18:00:00Z",
                     "deadline_at": "2026-05-17T18:00:00Z",
                     "effort_minutes": 30,
+                    "importance": 3,
                     "metadata_confidence": 0.82,
                 ]
             ]]
@@ -28,6 +29,7 @@ final class ClaudeClassifierTests: XCTestCase {
         XCTAssertNotNil(result.scheduledAt)
         XCTAssertNotNil(result.deadlineAt)
         XCTAssertEqual(result.effortMinutes, 30)
+        XCTAssertEqual(result.importance, 3)
         XCTAssertEqual(result.metadataConfidence, 0.82)
     }
 
@@ -67,7 +69,7 @@ final class OllamaClassifierTests: XCTestCase {
     func testParsesJSONReply() async throws {
         let transport = MockHTTPTransport()
         let inner = """
-        {"type":"reminder","title":"Stand up","tags":["meeting"],"scheduled_at":"2026-05-16T09:00:00Z","deadline_at":"2026-05-16T09:30:00Z","effort_minutes":10,"metadata_confidence":0.9}
+        {"type":"reminder","title":"Stand up","tags":["meeting"],"scheduled_at":"2026-05-16T09:00:00Z","deadline_at":"2026-05-16T09:30:00Z","effort_minutes":10,"importance":4,"metadata_confidence":0.9}
         """
         transport.stub(path: "/api/chat", json: [
             "message": ["role": "assistant", "content": inner]
@@ -79,6 +81,7 @@ final class OllamaClassifierTests: XCTestCase {
         XCTAssertEqual(result.tags, ["meeting"])
         XCTAssertNotNil(result.deadlineAt)
         XCTAssertEqual(result.effortMinutes, 10)
+        XCTAssertEqual(result.importance, 4)
         XCTAssertEqual(result.metadataConfidence, 0.9)
     }
 

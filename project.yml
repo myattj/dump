@@ -12,8 +12,8 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.1.1"
+    CURRENT_PROJECT_VERSION: "4"
     ENABLE_HARDENED_RUNTIME: YES
     CODE_SIGN_STYLE: Automatic
     DEAD_CODE_STRIPPING: YES
@@ -85,14 +85,14 @@ targets:
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
         CADisableMinimumFrameDuration: true
         NSHumanReadableCopyright: ""
-        SUFeedURL: https://updates.dump.example/appcast.xml
+        SUFeedURL: https://myattj.github.io/dump-updates/appcast.xml
         SUEnableInstallerLauncherService: true
-        SUPublicEDKey: REPLACE_WITH_SPARKLE_ED25519_PUBLIC_KEY
+        SUPublicEDKey: CSXW1L8m4x/hSs0Bh7OuArx/DnL3UWh6245lvVkhvZ4=
     entitlements:
       path: Resources/Dump.entitlements
       properties:
         com.apple.security.app-sandbox: false
-        com.apple.security.cs.allow-jit: false
+        com.apple.security.cs.allow-jit: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.joshmyatt.dump

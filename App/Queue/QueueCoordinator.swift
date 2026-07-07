@@ -39,6 +39,17 @@ public final class QueueCoordinator {
         window.toggle()
     }
 
+    /// Opens (never toggles) the queue and lands the selection on `id` —
+    /// how a notification tap arrives at the item that fired.
+    public func reveal(id: String?) {
+        window.show()
+        guard let id else { return }
+        Task {
+            await viewModel.refresh()
+            viewModel.selectedID = id
+        }
+    }
+
     public func refresh() {
         Task { await viewModel.refresh() }
     }

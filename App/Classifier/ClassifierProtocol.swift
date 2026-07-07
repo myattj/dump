@@ -7,6 +7,8 @@ public struct ClassifierResult: Equatable, Sendable {
     public var scheduledAt: Date?
     public var deadlineAt: Date?
     public var effortMinutes: Int?
+    /// 1 = low … 4 = critical, matching `Frontmatter.importance`.
+    public var importance: Int?
     public var metadataConfidence: Double?
 
     public init(
@@ -16,6 +18,7 @@ public struct ClassifierResult: Equatable, Sendable {
         scheduledAt: Date? = nil,
         deadlineAt: Date? = nil,
         effortMinutes: Int? = nil,
+        importance: Int? = nil,
         metadataConfidence: Double? = nil
     ) {
         self.type = type
@@ -24,7 +27,13 @@ public struct ClassifierResult: Equatable, Sendable {
         self.scheduledAt = scheduledAt
         self.deadlineAt = deadlineAt
         self.effortMinutes = effortMinutes
+        self.importance = importance
         self.metadataConfidence = metadataConfidence
+    }
+
+    /// Clamps a model-emitted importance onto the 1…4 scale.
+    public static func normalizedImportance(_ raw: Int?) -> Int? {
+        raw.map { min(max($0, 1), 4) }
     }
 
     public static let unknown = ClassifierResult(type: .unknown)

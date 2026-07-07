@@ -93,6 +93,54 @@ enum DumpUI {
 
         /// Press feedback — extra-tight so the scale snaps back instantly.
         static let press: Animation = .spring(response: 0.18, dampingFraction: 0.72)
+
+        /// 130ms ease-in. Removals and dismissals — things accelerate away.
+        /// Mirrors the AppKit-side `Window.easeInExit` curve so SwiftUI and
+        /// panel chrome can't drift apart.
+        static let exit: Animation = .timingCurve(0.4, 0, 1, 1, duration: 0.13)
+
+        /// Physics for the floating-panel chrome. One definition shared by
+        /// PanelAnimator/PanelWaveTransform so all three panels — and any
+        /// future chrome like the pin settle-dip — move identically.
+        /// Main-actor because Wave's `Spring` and CAMediaTimingFunction are
+        /// reference types.
+        @MainActor
+        enum Window {
+            static let showSpring = Spring(dampingRatio: 0.82, response: 0.32)
+            static let showDropSpring = Spring(dampingRatio: 0.88, response: 0.30)
+            /// Critically damped and quick — exits should not bounce.
+            static let exitSpring = Spring(dampingRatio: 1.0, response: 0.18)
+            static let showFadeDuration: TimeInterval = 0.18
+            static let hideFadeDuration: TimeInterval = 0.13
+            static let entranceScale: CGFloat = 0.94
+            /// The entrance lands from a +6pt offset. Exits reuse the same
+            /// axis so dismissal retraces the arrival path.
+            static let entranceDrop: CGFloat = 6
+            static let cancelScale: CGFloat = 0.97
+            static let cancelDrop: CGFloat = 6
+            /// Committed exits (submit, open) lift further along the entrance
+            /// axis — the panel visibly leaves as "sent".
+            static let commitScale: CGFloat = 0.965
+            static let commitDrop: CGFloat = 10
+            static let easeOutExpo = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
+            static let easeInExit = CAMediaTimingFunction(controlPoints: 0.4, 0, 1, 1)
+        }
+
+        /// Physics for the queue's swipe-to-complete. The threshold constant
+        /// is shared by the haptic tick, the checkmark pop, and the commit
+        /// decision, so it must exist exactly once.
+        @MainActor
+        enum Swipe {
+            static let settleSpring = Spring(dampingRatio: 0.86, response: 0.30)
+            static let commitThreshold: CGFloat = 76
+            /// Hysteresis: once past `commitThreshold`, the commit only
+            /// disengages below this — jitter at the boundary can't
+            /// machine-gun haptics.
+            static let releaseThreshold: CGFloat = 64
+            static let maxDrag: CGFloat = 104
+            /// Overdrag resistance past `maxDrag`, matching scroll-edge feel.
+            static let rubberBand: CGFloat = 0.18
+        }
     }
 }
 
@@ -123,19 +171,31 @@ enum Motion {
 
     /// Press feedback — extra-tight so the scale snaps back instantly.
     static let press = DumpUI.Motion.press
+
+    /// 130ms ease-in. Removals and dismissals — things accelerate away.
+    static let exit = DumpUI.Motion.exit
 }
 
 /// Tactile press feedback. Drop-in replacement for `.buttonStyle(.plain)` — same
 /// visuals, plus a 0.985 scale-down with a quick spring back on release.
+/// Press-in applies instantly (nil animation) so quick clicks never feel
+/// mushy; only the release springs back. Reduce-motion keeps the opacity dip
+/// and holds scale at 1.
 struct PressableButtonStyle: ButtonStyle {
     var pressedScale: CGFloat = 0.985
     var pressedOpacity: Double = 0.92
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? pressedScale : 1, anchor: .center)
+            .scaleEffect(reduceMotion ? 1 : (configuration.isPressed ? pressedScale : 1), anchor: .center)
             .opacity(configuration.isPressed ? pressedOpacity : 1)
-            .animation(Motion.press, value: configuration.isPressed)
+            .animation(
+                configuration.isPressed
+                    ? nil
+                    : (reduceMotion ? .easeOut(duration: 0.12) : Motion.press),
+                value: configuration.isPressed
+            )
     }
 }
 
@@ -145,6 +205,27 @@ struct PressableButtonStyle: ButtonStyle {
 @MainActor
 func resolved(_ animation: Animation, reduceMotion: Bool, reduced: Animation? = nil) -> Animation {
     reduceMotion ? (reduced ?? .easeOut(duration: 0.12)) : animation
+}
+
+/// Transition counterpart of `resolved(_:reduceMotion:)`: any transition that
+/// moves or scales collapses to a plain crossfade under reduce motion —
+/// fade-not-nothing, applied consistently at every call site.
+@MainActor
+func reducedTransition(_ full: AnyTransition, reduceMotion: Bool) -> AnyTransition {
+    reduceMotion ? .opacity : full
+}
+
+/// Shared transition for the ✕ clear buttons in the query and queue input
+/// fields, so the two fields can't drift apart.
+@MainActor
+func clearButtonTransition(reduceMotion: Bool) -> AnyTransition {
+    reducedTransition(
+        .asymmetric(
+            insertion: .scale(scale: 0.5, anchor: .center).combined(with: .opacity),
+            removal: .scale(scale: 0.7, anchor: .center).combined(with: .opacity)
+        ),
+        reduceMotion: reduceMotion
+    )
 }
 
 /// Bridge NSVisualEffectView into SwiftUI so panels can sit on the
@@ -402,6 +483,15 @@ struct WindowDragHandle: NSViewRepresentable {
     }
 }
 
+/// How a panel is leaving. Committed exits (submit, open) lift further along
+/// the entrance axis so the dismissal reads as "sent"; cancelled exits retrace
+/// the arrival path neutrally. Both are Wave retargets, so a dismissal that
+/// interrupts the entrance redirects the in-flight spring instead of snapping.
+enum PanelDismissIntent {
+    case cancelled
+    case committed
+}
+
 /// Animated panel presentation. Mirrors Raycast/Spotlight: spring-driven scale
 /// with a small Y drop so the panel lands from above. Reduce-motion users get
 /// a flat fade.
@@ -433,25 +523,16 @@ enum PanelAnimator {
         if reduced {
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.12
-                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
+                ctx.timingFunction = DumpUI.Motion.Window.easeOutExpo
                 panel.animator().alphaValue = 1
             }
             return
         }
 
-        // Re-anchor at center so the scale animation pivots around the middle,
-        // but preserve the visual frame — changing anchorPoint alone shifts the
-        // layer by (anchorΔ × bounds), which would push the content off-screen.
-        if layer.anchorPoint != CGPoint(x: 0.5, y: 0.5) {
-            let oldFrame = layer.frame
-            layer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
-            layer.frame = oldFrame
-        }
-
         // Fade with a quick ease-out so we don't see anything mid-spring.
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
-            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
+            ctx.duration = DumpUI.Motion.Window.showFadeDuration
+            ctx.timingFunction = DumpUI.Motion.Window.easeOutExpo
             panel.animator().alphaValue = 1
         }
 
@@ -460,11 +541,26 @@ enum PanelAnimator {
         transform.show(fromRest: !wasVisible)
     }
 
+    /// One-shot physical acknowledgment on an already-visible panel: a small
+    /// velocity impulse into the drop spring so the panel dips ~2pt and
+    /// settles back. Used when pinning the queue — the panel "anchors" itself.
+    static func nudge(_ panel: NSPanel) {
+        guard !reduceMotion, panel.isVisible, let layer = panel.contentView?.layer else { return }
+        let id = ObjectIdentifier(panel)
+        let transform = waveTransforms[id] ?? PanelWaveTransform(layer: layer)
+        waveTransforms[id] = transform
+        transform.impulse()
+    }
+
     /// Hide with a fast fade-out + slight scale-down, then `orderOut`.
-    static func hide(_ panel: NSPanel, completion: (@MainActor () -> Void)? = nil) {
+    static func hide(
+        _ panel: NSPanel,
+        intent: PanelDismissIntent = .cancelled,
+        completion: (@MainActor () -> Void)? = nil
+    ) {
         guard panel.isVisible else { completion?(); return }
         let reduced = reduceMotion
-        let duration = reduced ? 0.10 : 0.13
+        let duration = reduced ? 0.10 : DumpUI.Motion.Window.hideFadeDuration
         let layer = panel.contentView?.layer
         let id = ObjectIdentifier(panel)
         generations[id, default: 0] += 1
@@ -473,12 +569,12 @@ enum PanelAnimator {
         if !reduced, let layer {
             let transform = waveTransforms[id] ?? PanelWaveTransform(layer: layer)
             waveTransforms[id] = transform
-            transform.hide()
+            transform.hide(intent: intent)
         }
 
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = duration
-            ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.4, 0, 1, 1)
+            ctx.timingFunction = DumpUI.Motion.Window.easeInExit
             panel.animator().alphaValue = 0
         }, completionHandler: {
             // NSAnimationContext's completion is nominally non-isolated; the
@@ -524,8 +620,8 @@ private final class PanelWaveTransform: @unchecked Sendable {
 
     init(layer: CALayer) {
         self.layer = layer
-        self.scaleAnimator = SpringAnimator<CGFloat>(spring: Spring(dampingRatio: 0.82, response: 0.32))
-        self.dropAnimator = SpringAnimator<CGFloat>(spring: Spring(dampingRatio: 0.88, response: 0.30))
+        self.scaleAnimator = SpringAnimator<CGFloat>(spring: DumpUI.Motion.Window.showSpring)
+        self.dropAnimator = SpringAnimator<CGFloat>(spring: DumpUI.Motion.Window.showDropSpring)
 
         scaleAnimator.valueChanged = { [weak self] value in
             Task { @MainActor [weak self] in
@@ -542,9 +638,14 @@ private final class PanelWaveTransform: @unchecked Sendable {
     }
 
     func show(fromRest: Bool) {
+        // Re-install the entrance physics — a show that interrupts a hide
+        // reverses with preserved velocity on the entrance springs, not the
+        // stiffer exit ones.
+        scaleAnimator.spring = DumpUI.Motion.Window.showSpring
+        dropAnimator.spring = DumpUI.Motion.Window.showDropSpring
         if fromRest {
-            scale = 0.94
-            drop = 6
+            scale = DumpUI.Motion.Window.entranceScale
+            drop = DumpUI.Motion.Window.entranceDrop
             scaleAnimator.value = scale
             dropAnimator.value = drop
             apply()
@@ -552,8 +653,29 @@ private final class PanelWaveTransform: @unchecked Sendable {
         retarget(scale: 1, drop: 0)
     }
 
-    func hide() {
-        retarget(scale: 0.97, drop: 0)
+    func hide(intent: PanelDismissIntent) {
+        // Exits are critically damped and quick; both intents retrace the
+        // entrance axis (same drop sign), committed just travels further.
+        scaleAnimator.spring = DumpUI.Motion.Window.exitSpring
+        dropAnimator.spring = DumpUI.Motion.Window.exitSpring
+        switch intent {
+        case .cancelled:
+            retarget(scale: DumpUI.Motion.Window.cancelScale, drop: DumpUI.Motion.Window.cancelDrop)
+        case .committed:
+            retarget(scale: DumpUI.Motion.Window.commitScale, drop: DumpUI.Motion.Window.commitDrop)
+        }
+    }
+
+    /// Velocity-only kick into the drop spring: target stays at rest, so the
+    /// panel dips a couple of points and springs back. Wave preserves
+    /// caller-set velocity across start(), and an unpin mid-dip retargets
+    /// smoothly.
+    func impulse() {
+        if dropAnimator.value == nil { dropAnimator.value = drop }
+        dropAnimator.spring = DumpUI.Motion.Window.showDropSpring
+        dropAnimator.target = 0
+        dropAnimator.velocity = 220
+        dropAnimator.start()
     }
 
     func stopAndReset() {
@@ -575,9 +697,24 @@ private final class PanelWaveTransform: @unchecked Sendable {
 
     private func apply() {
         guard let layer else { return }
+        // Scale about the visual center regardless of the layer's
+        // anchorPoint (transforms apply about the anchor):
+        //   p' = s·p + (1−s)·(center − anchor) + (0, drop)
+        // Computed from bounds — well-defined under any active transform,
+        // unlike anchorPoint/frame round-trips which read `frame` while the
+        // transform is non-identity.
+        let bounds = layer.bounds
+        let anchor = CGPoint(
+            x: bounds.minX + layer.anchorPoint.x * bounds.width,
+            y: bounds.minY + layer.anchorPoint.y * bounds.height
+        )
+        let tx = (1 - scale) * (bounds.midX - anchor.x)
+        let ty = (1 - scale) * (bounds.midY - anchor.y) + drop
+        var t = CATransform3DMakeTranslation(tx, ty, 0)
+        t = CATransform3DScale(t, scale, scale, 1)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer.transform = CATransform3DTranslate(CATransform3DMakeScale(scale, scale, 1), 0, drop, 0)
+        layer.transform = t
         CATransaction.commit()
     }
 }

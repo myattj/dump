@@ -50,6 +50,7 @@ public struct BedrockClassifier: Classifier {
             scheduledAt: parsed.scheduled_at.flatMap { ISO8601DateFormatter.anthropic.date(from: $0) },
             deadlineAt: parsed.deadline_at.flatMap { ISO8601DateFormatter.anthropic.date(from: $0) },
             effortMinutes: parsed.effort_minutes,
+            importance: ClassifierResult.normalizedImportance(parsed.importance),
             metadataConfidence: parsed.metadata_confidence
         )
     }
@@ -58,13 +59,14 @@ public struct BedrockClassifier: Classifier {
         let iso = ISO8601DateFormatter.anthropic.string(from: now)
         return """
         Classify the user's note. Reply only with compact JSON of the form:
-        {"type":"task|reminder|note|idea|reference|unknown","title":"...","tags":["..."],"scheduled_at":"ISO-8601 or null","deadline_at":"ISO-8601 or null","effort_minutes":30,"metadata_confidence":0.8}
+        {"type":"task|reminder|note|idea|reference|unknown","title":"...","tags":["..."],"scheduled_at":"ISO-8601 or null","deadline_at":"ISO-8601 or null","effort_minutes":30,"importance":3,"metadata_confidence":0.8}
         Use "reminder" only for explicit remind/notify/alert requests.
         Use "task" for actionable work, including work with due dates.
         scheduled_at is only a notification fire time. deadline_at is for due
         dates/target dates used in the task queue. Estimate effort_minutes when
-        inferable from the text. Current time: \(iso). Title <= 60 chars. Up to
-        5 lowercase tags.
+        inferable from the text. importance is 1 (low) to 4 (critical); set it
+        only when the text signals priority, else null. Current time: \(iso).
+        Title <= 60 chars. Up to 5 lowercase tags.
         """
     }
 
@@ -106,6 +108,7 @@ public struct BedrockClassifier: Classifier {
         let scheduled_at: String?
         let deadline_at: String?
         let effort_minutes: Int?
+        let importance: Int?
         let metadata_confidence: Double?
     }
 }

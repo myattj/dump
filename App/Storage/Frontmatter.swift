@@ -31,6 +31,13 @@ public struct Frontmatter: Codable, Equatable, Sendable {
     public var meetingDate: Date?
     public var deadlineAt: Date?
     public var effortMinutes: Int?
+    /// 1 = low, 2 = normal, 3 = high, 4 = critical. nil reads as normal.
+    public var importance: Int?
+    public var snoozedUntil: Date?
+    public var snoozeCount: Int?
+    /// True once the user has explicitly set or cleared queue metadata —
+    /// the classifier then only fills fields that are still nil.
+    public var metadataEdited: Bool?
     public var queueRank: Int?
     public var queueScore: Double?
     public var completedAt: Date?
@@ -52,6 +59,10 @@ public struct Frontmatter: Codable, Equatable, Sendable {
         meetingDate: Date? = nil,
         deadlineAt: Date? = nil,
         effortMinutes: Int? = nil,
+        importance: Int? = nil,
+        snoozedUntil: Date? = nil,
+        snoozeCount: Int? = nil,
+        metadataEdited: Bool? = nil,
         queueRank: Int? = nil,
         queueScore: Double? = nil,
         completedAt: Date? = nil,
@@ -72,6 +83,10 @@ public struct Frontmatter: Codable, Equatable, Sendable {
         self.meetingDate = meetingDate
         self.deadlineAt = deadlineAt
         self.effortMinutes = effortMinutes
+        self.importance = importance
+        self.snoozedUntil = snoozedUntil
+        self.snoozeCount = snoozeCount
+        self.metadataEdited = metadataEdited
         self.queueRank = queueRank
         self.queueScore = queueScore
         self.completedAt = completedAt
@@ -108,6 +123,10 @@ public enum FrontmatterCodec {
         if let md = fm.meetingDate { lines.append("meeting_date: \(iso.string(from: md))") }
         if let d = fm.deadlineAt { lines.append("deadline_at: \(iso.string(from: d))") }
         if let e = fm.effortMinutes { lines.append("effort_minutes: \(e)") }
+        if let i = fm.importance { lines.append("importance: \(i)") }
+        if let s = fm.snoozedUntil { lines.append("snoozed_until: \(iso.string(from: s))") }
+        if let c = fm.snoozeCount { lines.append("snooze_count: \(c)") }
+        if let e = fm.metadataEdited { lines.append("metadata_edited: \(e)") }
         if let r = fm.queueRank { lines.append("queue_rank: \(r)") }
         if let s = fm.queueScore { lines.append("queue_score: \(formatDouble(s))") }
         if let c = fm.completedAt { lines.append("completed_at: \(iso.string(from: c))") }
@@ -163,6 +182,10 @@ public enum FrontmatterCodec {
             meetingDate: meeting,
             deadlineAt: deadline,
             effortMinutes: pairs["effort_minutes"].flatMap(Int.init),
+            importance: pairs["importance"].flatMap(Int.init),
+            snoozedUntil: pairs["snoozed_until"].flatMap { iso.date(from: $0) },
+            snoozeCount: pairs["snooze_count"].flatMap(Int.init),
+            metadataEdited: pairs["metadata_edited"].map { $0 == "true" },
             queueRank: pairs["queue_rank"].flatMap(Int.init),
             queueScore: pairs["queue_score"].flatMap(Double.init),
             completedAt: completed,

@@ -1,7 +1,7 @@
 import Foundation
 
 /// User-configurable root directory for all Dump output. Sources of truth:
-/// `UserDefaults` → fallback to `~/Documents/Dump/`.
+/// `UserDefaults` -> fallback to `~/Dump/`.
 public final class StoragePreference: @unchecked Sendable {
     public static let defaultsKey = "dump.storagePath"
 
@@ -14,7 +14,7 @@ public final class StoragePreference: @unchecked Sendable {
                 fallback: URL? = nil) {
         self.defaults = defaults
         self.fallback = fallback ?? FileManager.default
-            .urls(for: .documentDirectory, in: .userDomainMask).first!
+            .homeDirectoryForCurrentUser
             .appendingPathComponent("Dump", isDirectory: true)
     }
 

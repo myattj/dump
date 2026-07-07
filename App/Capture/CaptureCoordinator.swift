@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import OSLog
 
@@ -6,7 +7,12 @@ import OSLog
 /// daemon index update. The window closes before any of the slow work
 /// happens so latency stays under 300ms.
 @MainActor
-public final class CaptureCoordinator {
+public final class CaptureCoordinator: ObservableObject {
+    /// Bumped the moment a capture is durably written — before the slow
+    /// classify/index work — so the menu-bar icon can acknowledge the save
+    /// without adding any latency to the submit path.
+    @Published public private(set) var captureTick = 0
+
     private let storage: StoragePreference
     private let writer: MarkdownWriter
     private let classifier: ClassifierHub
@@ -14,6 +20,7 @@ public final class CaptureCoordinator {
     private let daemon: QMDDaemonController
     private let queryEngine: QueryEngine
     private let pdfImporter: PDFImporter
+    private let onQueueChanged: @MainActor @Sendable () -> Void
     private let log = Logger(subsystem: "com.joshmyatt.dump", category: "capture")
 
     public private(set) lazy var quickWindow: CaptureWindowController = {
@@ -33,7 +40,8 @@ public final class CaptureCoordinator {
         writer: MarkdownWriter,
         classifier: ClassifierHub,
         scheduler: SchedulerService,
-        daemon: QMDDaemonController
+        daemon: QMDDaemonController,
+        onQueueChanged: @escaping @MainActor @Sendable () -> Void = {}
     ) {
         self.storage = storage
         self.writer = writer
@@ -42,6 +50,7 @@ public final class CaptureCoordinator {
         self.daemon = daemon
         self.queryEngine = QueryEngine(daemon: daemon)
         self.pdfImporter = PDFImporter(storage: storage, writer: writer)
+        self.onQueueChanged = onQueueChanged
     }
 
     public func showQuick() { quickWindow.toggle() }
@@ -56,9 +65,13 @@ public final class CaptureCoordinator {
                     fm.meetingDate = Date()
                 }
             }
+            captureTick += 1
             await classifyAndPersist(at: result.url, body: body, source: source)
             await indexUpdated(source: source)
             await scheduler.reconcile()
+            if source != .meeting {
+                onQueueChanged()
+            }
         } catch {
             log.error("capture write failed: \(String(describing: error), privacy: .public)")
         }
@@ -67,16 +80,23 @@ public final class CaptureCoordinator {
     private func classifyAndPersist(at url: URL, body: String, source: Frontmatter.Source) async {
         guard source != .meeting else { return }
         let result = await classifier.classify(body)
+        let metadata = QueueMetadataExtractor.extract(from: body)
         do {
             let raw = try String(contentsOf: url, encoding: .utf8)
             var (fm, _) = try FrontmatterCodec.decode(raw)
-            fm.type = result.type
+            if result.type != .unknown {
+                fm.type = result.type
+            } else if let inferred = metadata.inferredType {
+                fm.type = inferred
+            }
             fm.title = result.title ?? fm.title
             fm.tags = result.tags.isEmpty ? fm.tags : result.tags
-            fm.scheduledAt = result.scheduledAt
-            fm.deadlineAt = result.deadlineAt
-            fm.effortMinutes = result.effortMinutes
-            fm.metadataConfidence = result.metadataConfidence
+            fm.scheduledAt = result.scheduledAt ?? fm.scheduledAt ?? metadata.scheduledAt
+            fm.deadlineAt = result.deadlineAt ?? fm.deadlineAt ?? metadata.deadlineAt
+            fm.effortMinutes = result.effortMinutes ?? fm.effortMinutes ?? metadata.effortMinutes
+            // Explicit syntax ("!!", "urgent") outranks the model's guess.
+            fm.importance = metadata.importance ?? result.importance ?? fm.importance
+            fm.metadataConfidence = result.metadataConfidence ?? fm.metadataConfidence
             fm.classifier = await classifier.activeIdentifier
             try writer.rewriteFrontmatter(at: url, with: fm)
         } catch {

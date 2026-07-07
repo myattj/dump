@@ -22,6 +22,13 @@ final class StoragePreferenceTests: XCTestCase {
         XCTAssertEqual(pref.root, fallback)
     }
 
+    func testBuiltInDefaultAvoidsDocumentsPrivacyPrompt() {
+        let pref = StoragePreference(defaults: defaults)
+        let expected = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Dump", isDirectory: true)
+        XCTAssertEqual(pref.root, expected)
+    }
+
     func testCustomPathPersists() {
         let pref = StoragePreference(defaults: defaults, fallback: URL(fileURLWithPath: "/tmp/x"))
         let target = URL(fileURLWithPath: "/tmp/dump-test")

@@ -15,6 +15,7 @@ public final class MockNotificationCenter: NotificationScheduling, @unchecked Se
         var scheduled: [Scheduled] = []
         var cancelled: [String] = []
         var authorized: Bool = true
+        var authorizationRequestCount = 0
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
@@ -23,13 +24,17 @@ public final class MockNotificationCenter: NotificationScheduling, @unchecked Se
 
     public var scheduled: [Scheduled] { state.withLock { $0.scheduled } }
     public var cancelled: [String] { state.withLock { $0.cancelled } }
+    public var authorizationRequestCount: Int { state.withLock { $0.authorizationRequestCount } }
     public var authorized: Bool {
         get { state.withLock { $0.authorized } }
         set { state.withLock { $0.authorized = newValue } }
     }
 
     public func requestAuthorizationIfNeeded() async -> Bool {
-        state.withLock { $0.authorized }
+        state.withLock {
+            $0.authorizationRequestCount += 1
+            return $0.authorized
+        }
     }
 
     public func schedule(id: String, title: String, body: String, fireAt: Date, userInfo: [String: String]) async throws {

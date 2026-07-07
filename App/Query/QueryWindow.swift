@@ -41,10 +41,18 @@ public final class QueryWindowController {
     }
 
     public func close() {
+        close(intent: .cancelled)
+    }
+
+    /// Close with a dismissal intent: opening a hit passes `.committed` so
+    /// the panel lifts away along its entrance axis ("sent"), while Esc and
+    /// click-away keep the neutral `.cancelled` exit.
+    /// Internal (not public) because `PanelDismissIntent` is internal.
+    func close(intent: PanelDismissIntent) {
         isShowing = false
         guard let panel, !hideInFlight else { return }
         hideInFlight = true
-        PanelAnimator.hide(panel) { [weak self] in
+        PanelAnimator.hide(panel, intent: intent) { [weak self] in
             guard let self else { return }
             self.hideInFlight = false
             if self.isShowing {
@@ -63,7 +71,8 @@ public final class QueryWindowController {
             let view = QueryView(
                 viewModel: viewModel,
                 focusRequest: focusRequest,
-                onCancel: { [weak self] in self?.close() }
+                onCancel: { [weak self] in self?.close() },
+                onCommitClose: { [weak self] in self?.close(intent: .committed) }
             )
             let host = NSHostingController(rootView: view)
             DumpWindowChrome.prepareHost(host, style: .query)
@@ -76,7 +85,12 @@ public final class QueryWindowController {
             panel = p
         }
         guard let panel else { return }
-        panel.center()
+        // Only reposition when the panel is actually off-screen — a re-show
+        // that interrupts the hide animation retargets in place instead of
+        // teleporting the still-visible window to center.
+        if !panel.isVisible {
+            panel.center()
+        }
         NSApp.activate(ignoringOtherApps: true)
         PanelAnimator.show(panel)
         focusRequest.request()
@@ -107,9 +121,29 @@ public final class QueryViewModel: ObservableObject {
     @Published public var isLoading: Bool = false
     @Published public var error: String?
     @Published public var selection: QuerySelection?
+    /// True while an Ask-mode answer is being synthesised on top of already
+    /// visible hits — drives the "Synthesising…" chip.
+    @Published public private(set) var isSynthesizing: Bool = false
+    /// Bumped once per newly synthesised answer so the answer card's sparkle
+    /// bounces exactly once per answer, never on re-selection.
+    @Published public private(set) var answerRevision: Int = 0
+    /// True while the current result set should cascade in (a reveal into an
+    /// empty panel). Cleared on the first user-driven selection change so
+    /// arrow keys never replay staggered insertions.
+    @Published public private(set) var revealCascade: Bool = false
 
     private let engine: QueryEngine
     private let synthesizer: Synthesizing
+    /// Generation counter: only the newest run() may mutate state after an
+    /// await. Stale-while-revalidate makes overlapping runs routine (a
+    /// refined query can be submitted while the previous synthesis is still
+    /// in flight), and a stale synthesis must not animate in over newer
+    /// results.
+    private var runToken = 0
+
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
 
     public init(engine: QueryEngine, synthesizer: Synthesizing) {
         self.engine = engine
@@ -119,27 +153,60 @@ public final class QueryViewModel: ObservableObject {
     public func run() async {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
+        runToken += 1
+        let token = runToken
         isLoading = true
-        defer { isLoading = false }
+        isSynthesizing = false
+        defer {
+            if token == runToken { isLoading = false }
+        }
         error = nil
-        answer = nil
-        hits = []
-        selection = nil
+        // Stale-while-revalidate: keep the previous results rendered (dimmed
+        // by the view) during the reload so repeat searches crossfade in
+        // place instead of strobing results → empty → spinner → results.
+        let hadContent = !hits.isEmpty || answer != nil
         do {
             let results = try await engine.search(q, limit: 10)
-            hits = results
-            lastRunQuery = q
-            if mode == .ask, !results.isEmpty {
-                answer = try await synthesizer.synthesize(query: q, hits: results)
+            guard token == runToken else { return }
+            revealCascade = !hadContent && !results.isEmpty && !reduceMotion
+            withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
+                hits = results
+                lastRunQuery = q
+                answer = nil
+                selection = results.first.map { .hit($0.id) }
             }
-            // Default selection — answer if we have one, else first hit.
-            if answer != nil {
-                selection = .answer
-            } else if let first = results.first {
-                selection = .hit(first.id)
+            if mode == .ask, !results.isEmpty {
+                // Progressive reveal: the best hit is already on screen as
+                // the primary card; the answer glides in on top when ready.
+                isSynthesizing = true
+                defer {
+                    if token == runToken { isSynthesizing = false }
+                }
+                do {
+                    let synthesis = try await synthesizer.synthesize(query: q, hits: results)
+                    guard token == runToken else { return }
+                    answerRevision += 1
+                    withAnimation(resolved(Motion.panel, reduceMotion: reduceMotion)) {
+                        answer = synthesis
+                        selection = .answer
+                    }
+                } catch {
+                    guard token == runToken else { return }
+                    // Keep the search results — they're still the answer's
+                    // raw material. The view shows an inline failure note.
+                    withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
+                        self.error = String(describing: error)
+                    }
+                }
             }
         } catch {
-            self.error = String(describing: error)
+            guard token == runToken else { return }
+            withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
+                self.error = String(describing: error)
+                hits = []
+                answer = nil
+                selection = nil
+            }
         }
     }
 
@@ -150,6 +217,15 @@ public final class QueryViewModel: ObservableObject {
         answer = nil
         error = nil
         selection = nil
+        isSynthesizing = false
+        revealCascade = false
+    }
+
+    /// User-driven promotion of a row to the primary slot (click). Routed
+    /// through the model so it can retire the one-shot results cascade.
+    public func userSelect(_ sel: QuerySelection) {
+        revealCascade = false
+        selection = sel
     }
 
     /// Hit corresponding to the current selection, or nil if the answer is
@@ -167,6 +243,7 @@ public final class QueryViewModel: ObservableObject {
     /// Move selection one step down in the rail (answer → hit 1 → hit 2 …).
     /// Clamps at the end.
     public func selectNext() {
+        revealCascade = false
         let order = selectionOrder()
         guard !order.isEmpty else { return }
         if let current = selection, let idx = order.firstIndex(of: current) {
@@ -178,6 +255,7 @@ public final class QueryViewModel: ObservableObject {
 
     /// Move selection one step up. Clamps at the start.
     public func selectPrevious() {
+        revealCascade = false
         let order = selectionOrder()
         guard !order.isEmpty else { return }
         if let current = selection, let idx = order.firstIndex(of: current) {
@@ -198,11 +276,43 @@ public final class QueryViewModel: ObservableObject {
 // MARK: - View
 
 struct QueryView: View {
+    /// Who moved the selection last. Keyboard navigation is a key-repeat
+    /// path, so it gets a 100ms crossfade; pointer promotion keeps the
+    /// springy card transition.
+    private enum SelectionSource {
+        case keyboard, pointer
+    }
+
     @ObservedObject var viewModel: QueryViewModel
     @ObservedObject var focusRequest: PanelFocusRequest
     let onCancel: @MainActor () -> Void
+    let onCommitClose: @MainActor () -> Void
     @FocusState private var focused: Bool
+    @State private var selectionSource: SelectionSource = .pointer
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// Single Equatable key for the content region's animation — state
+    /// swaps (mode, loading, error, results arriving) animate; nothing on
+    /// the typing path is in here.
+    private struct ContentPhase: Equatable {
+        let mode: QueryMode
+        let isLoading: Bool
+        let hasError: Bool
+        let hasHits: Bool
+        let hasAnswer: Bool
+        let isSynthesizing: Bool
+    }
+
+    private var contentPhase: ContentPhase {
+        ContentPhase(
+            mode: viewModel.mode,
+            isLoading: viewModel.isLoading,
+            hasError: viewModel.error != nil,
+            hasHits: !viewModel.hits.isEmpty,
+            hasAnswer: viewModel.answer != nil,
+            isSynthesizing: viewModel.isSynthesizing
+        )
+    }
 
     var body: some View {
         DumpPanelShell(style: .query) {
@@ -210,6 +320,7 @@ struct QueryView: View {
                 titleStrip
                 searchHeader
                 content
+                    .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: contentPhase)
             }
         }
         .onAppear { requestInputFocus() }
@@ -220,12 +331,6 @@ struct QueryView: View {
             onCancel()
             return .handled
         }
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.mode)
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.isLoading)
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.error)
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.answer?.text)
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.hits.count)
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.selection)
     }
 
     private func requestInputFocus() {
@@ -259,7 +364,7 @@ struct QueryView: View {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundStyle(viewModel.isLoading ? Color.accentColor : Color.primary.opacity(0.7))
-                .symbolEffect(.variableColor.iterative.reversing, options: .repeating, isActive: viewModel.isLoading)
+                .symbolEffect(.variableColor.iterative.reversing, options: .repeating, isActive: viewModel.isLoading && !reduceMotion)
             TextField(
                 "Search archive",
                 text: $viewModel.query,
@@ -280,6 +385,9 @@ struct QueryView: View {
                        let hit = viewModel.selectedHit {
                         openHit(hit)
                     } else {
+                        // Fresh results enter with the full card transition,
+                        // not the keyboard crossfade.
+                        selectionSource = .pointer
                         Task { await viewModel.run() }
                     }
                 }
@@ -289,14 +397,20 @@ struct QueryView: View {
                 }
                 .onKeyPress(.downArrow) {
                     if !viewModel.hits.isEmpty || viewModel.answer != nil {
-                        viewModel.selectNext()
+                        selectionSource = .keyboard
+                        withAnimation(resolved(Motion.micro, reduceMotion: reduceMotion)) {
+                            viewModel.selectNext()
+                        }
                         return .handled
                     }
                     return .ignored
                 }
                 .onKeyPress(.upArrow) {
                     if !viewModel.hits.isEmpty || viewModel.answer != nil {
-                        viewModel.selectPrevious()
+                        selectionSource = .keyboard
+                        withAnimation(resolved(Motion.micro, reduceMotion: reduceMotion)) {
+                            viewModel.selectPrevious()
+                        }
                         return .handled
                     }
                     return .ignored
@@ -312,10 +426,7 @@ struct QueryView: View {
                 .contentShape(Circle())
                 .labelStyle(.iconOnly)
                 .buttonStyle(PressableButtonStyle(pressedScale: 0.86))
-                .transition(.asymmetric(
-                    insertion: .scale(scale: 0.5, anchor: .center).combined(with: .opacity),
-                    removal: .scale(scale: 0.7, anchor: .center).combined(with: .opacity)
-                ))
+                .transition(clearButtonTransition(reduceMotion: reduceMotion))
             }
         }
         .padding(.horizontal, 14)
@@ -334,14 +445,8 @@ struct QueryView: View {
     }
 
     private var modePicker: some View {
-        Picker("Mode", selection: $viewModel.mode) {
-            ForEach(QueryMode.allCases) { mode in
-                Text(mode.label).tag(mode)
-            }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-        .frame(width: 140)
+        ModeToggle(mode: $viewModel.mode)
+            .frame(width: 150)
     }
 
     @ViewBuilder
@@ -357,7 +462,10 @@ struct QueryView: View {
                 }
                 if let err = viewModel.error {
                     errorRow(err)
-                        .transition(.opacity.combined(with: .scale(scale: 0.97)))
+                        .transition(reducedTransition(
+                            .opacity.combined(with: .scale(scale: 0.97)),
+                            reduceMotion: reduceMotion
+                        ))
                 }
                 Spacer(minLength: 0)
             }
@@ -379,12 +487,40 @@ struct QueryView: View {
     /// without making them load-bearing.
     private var resultsList: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if let err = viewModel.error {
+                inlineErrorBanner(err)
+                    .transition(reducedTransition(.opacity.combined(with: .offset(y: -4)), reduceMotion: reduceMotion))
+            }
+
             primarySlot
 
             if !otherItems.isEmpty {
                 othersSection
             }
         }
+        // Stale results stay visible but dim while a repeat search runs, so
+        // refining a query never strobes through the empty state.
+        .opacity(viewModel.isLoading ? 0.55 : 1)
+    }
+
+    /// Shown when synthesis fails but the search results are still good —
+    /// the hits stay on screen instead of vanishing behind a full-panel
+    /// error.
+    private func inlineErrorBanner(_ message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(.orange)
+                .symbolRenderingMode(.hierarchical)
+            Text(message)
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .queryQuietSurface(cornerRadius: 10)
     }
 
     @ViewBuilder
@@ -394,9 +530,13 @@ struct QueryView: View {
                 PrimaryAnswerCard(
                     answer: answer,
                     query: viewModel.lastRunQuery,
+                    revision: viewModel.answerRevision,
                     onCitationTap: { citation in
                         if let hit = viewModel.hits.first(where: { matches(file: $0.file, citationPath: citation.path) }) {
-                            viewModel.selection = .hit(hit.id)
+                            selectionSource = .pointer
+                            withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
+                                viewModel.userSelect(.hit(hit.id))
+                            }
                         }
                     }
                 )
@@ -415,6 +555,9 @@ struct QueryView: View {
 
     private var primaryTransition: AnyTransition {
         if reduceMotion { return .opacity }
+        // Key-repeat path: a plain 100ms crossfade. The springy lift is
+        // reserved for pointer promotion and fresh results.
+        if selectionSource == .keyboard { return .opacity }
         return .asymmetric(
             insertion: .opacity.combined(with: .offset(y: 6)).combined(with: .scale(scale: 0.985, anchor: .top)),
             removal: .opacity.combined(with: .scale(scale: 0.985, anchor: .top))
@@ -433,6 +576,15 @@ struct QueryView: View {
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(.tertiary)
                     .monospacedDigit()
+                    .contentTransition(reduceMotion ? .opacity : .numericText(value: Double(otherItems.count)))
+                    .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: otherItems.count)
+                if viewModel.isSynthesizing {
+                    SynthesizingChip()
+                        .transition(reducedTransition(
+                            .opacity.combined(with: .scale(scale: 0.9, anchor: .leading)),
+                            reduceMotion: reduceMotion
+                        ))
+                }
                 Spacer()
                 Text("↑↓ to switch")
                     .font(.system(size: 10, weight: .medium, design: .rounded))
@@ -443,12 +595,22 @@ struct QueryView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 2) {
-                        ForEach(otherItems) { item in
+                        ForEach(Array(otherItems.enumerated()), id: \.element.id) { index, item in
                             OtherMatchRow(
                                 item: item,
-                                onSelect: { viewModel.selection = item.selection }
+                                onSelect: {
+                                    selectionSource = .pointer
+                                    withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
+                                        viewModel.userSelect(item.selection)
+                                    }
+                                }
                             )
                             .id(item.scrollID)
+                            .transition(
+                                viewModel.revealCascade
+                                    ? staggeredCardTransition(index: index)
+                                    : reducedTransition(.opacity, reduceMotion: reduceMotion)
+                            )
                         }
                     }
                 }
@@ -488,6 +650,9 @@ struct QueryView: View {
 
     fileprivate func openHit(_ hit: QueryEngine.Hit) {
         let url = StoragePreference.shared.root.appendingPathComponent(hit.file)
+        // Commit the panel first so it lifts away as "sent" in sync with the
+        // user's Return, instead of waiting on the app-deactivation race.
+        onCommitClose()
         NSWorkspace.shared.open(url)
     }
 
@@ -498,20 +663,41 @@ struct QueryView: View {
             && viewModel.hits.isEmpty
     }
 
-    /// Per-card stagger: each result enters ~35ms after the previous one, with
-    /// a bouncy spring so the list cascades into view.
+    /// Per-card stagger for the one-shot results cascade: each row enters
+    /// 25ms after the previous one (capped at 5 rows) on the shared bouncy
+    /// spring. Only applied while `revealCascade` is set — a fresh reveal
+    /// into an empty panel — so keyboard-driven row churn never replays it.
     private func staggeredCardTransition(index: Int) -> AnyTransition {
         if reduceMotion { return .opacity }
-        let delay = min(Double(index), 8) * 0.035
-        let spring = Animation.spring(response: 0.42, dampingFraction: 0.78).delay(delay)
+        let delay = min(Double(index), 5) * 0.025
         return .asymmetric(
             insertion: AnyTransition
                 .opacity
                 .combined(with: .offset(y: 14))
                 .combined(with: .scale(scale: 0.985, anchor: .top))
-                .animation(spring),
-            removal: .opacity.animation(.easeOut(duration: 0.12))
+                .animation(Motion.bouncy.delay(delay)),
+            removal: .opacity.animation(Motion.exit)
         )
+    }
+
+    /// Quiet "answer is on the way" indicator shown next to the section
+    /// header while the best hit is already on screen.
+    private struct SynthesizingChip: View {
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+        var body: some View {
+            HStack(spacing: 4) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 9, weight: .semibold))
+                    .symbolEffect(.variableColor.iterative.reversing, options: .repeating, isActive: !reduceMotion)
+                Text("Synthesising\u{2026}")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .foregroundStyle(.tint)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
+            .background(Color.accentColor.opacity(0.12), in: Capsule())
+        }
     }
 
     private var emptyState: some View {
@@ -574,16 +760,16 @@ struct QueryView: View {
                 .foregroundStyle(.red)
                 .symbolRenderingMode(.hierarchical)
             VStack(alignment: .leading, spacing: 4) {
-            Text("Search failed")
-                .font(.system(size: 13, weight: .semibold))
-            Text(message)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .lineLimit(4)
-            Text("Check that the Dump daemon is running, then try again.")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-        }
+                Text("Search failed")
+                    .font(.system(size: 13, weight: .semibold))
+                Text(message)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(4)
+                Text("Check that the Dump daemon is running, then try again.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
             Spacer()
         }
         .padding(14)
@@ -770,9 +956,12 @@ struct PrimaryHitCard: View {
 struct PrimaryAnswerCard: View {
     let answer: SynthesisResult
     let query: String
+    /// Bumped once per newly synthesised answer — the sparkle bounces on
+    /// arrival only, never when the card is re-selected with arrow keys.
+    let revision: Int
     let onCitationTap: (SynthesisResult.Citation) -> Void
 
-    @State private var sparkleTrigger: Int = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -804,16 +993,11 @@ struct PrimaryAnswerCard: View {
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .queryQuietSurface(cornerRadius: 14)
-        .onAppear { sparkleTrigger += 1 }
     }
 
     private var header: some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 22, weight: .regular))
-                .foregroundStyle(.secondary)
-                .symbolRenderingMode(.hierarchical)
-                .symbolEffect(.bounce.up.byLayer, value: sparkleTrigger)
+            sparkleIcon
                 .frame(width: 28, alignment: .center)
                 .padding(.top, 3)
             VStack(alignment: .leading, spacing: 8) {
@@ -837,9 +1021,80 @@ struct PrimaryAnswerCard: View {
         }
     }
 
+    @ViewBuilder
+    private var sparkleIcon: some View {
+        let icon = Image(systemName: "sparkles")
+            .font(.system(size: 22, weight: .regular))
+            .foregroundStyle(.secondary)
+            .symbolRenderingMode(.hierarchical)
+
+        if reduceMotion {
+            icon
+        } else {
+            icon.symbolEffect(.bounce.up.byLayer, value: revision)
+        }
+    }
+
     private var echoedQuery: String {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "Answer" : trimmed
+    }
+}
+
+/// Custom two-segment Search/Ask toggle: a material thumb glides between the
+/// segments via matchedGeometryEffect instead of the stock segmented
+/// control's instant swap. Tab in the search field retargets it mid-flight.
+struct ModeToggle: View {
+    @Binding var mode: QueryMode
+    @Namespace private var thumbNamespace
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(QueryMode.allCases) { m in
+                segment(m)
+            }
+        }
+        .padding(3)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55), in: Capsule())
+        .overlay(Capsule().strokeBorder(DumpUI.SemanticStyle.hairline, lineWidth: 0.5))
+        .animation(resolved(Motion.interactive, reduceMotion: reduceMotion), value: mode)
+    }
+
+    private func segment(_ m: QueryMode) -> some View {
+        Button {
+            mode = m
+        } label: {
+            Text(m.label)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(mode == m ? Color.primary : Color.secondary)
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity)
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .background {
+            if mode == m {
+                thumb
+            }
+        }
+        .accessibilityAddTraits(mode == m ? [.isSelected] : [])
+    }
+
+    @ViewBuilder
+    private var thumb: some View {
+        let capsule = Capsule()
+            .fill(.thinMaterial)
+            .overlay(Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.10), radius: 2, y: 1)
+
+        if reduceMotion {
+            // No matched geometry under reduce motion — the selection swaps
+            // as a crossfade instead of physically gliding.
+            capsule
+        } else {
+            capsule.matchedGeometryEffect(id: "thumb", in: thumbNamespace)
+        }
     }
 }
 
@@ -1064,9 +1319,19 @@ struct QuickAction: View {
     @ViewBuilder
     private var background: some View {
         if prominent {
-            Capsule()
-                .fill(Color.accentColor.opacity(hovering ? 1.0 : 0.92))
-                .shadow(color: Color.accentColor.opacity(hovering ? 0.35 : 0.18), radius: hovering ? 8 : 4, y: 2)
+            // Two fixed-radius shadow layers crossfaded by opacity — never
+            // animate shadow radius/color on a hover-hot path (paint, not
+            // composite).
+            ZStack {
+                Capsule()
+                    .fill(Color.accentColor.opacity(0.92))
+                    .shadow(color: Color.accentColor.opacity(0.18), radius: 4, y: 2)
+                    .opacity(hovering ? 0 : 1)
+                Capsule()
+                    .fill(Color.accentColor)
+                    .shadow(color: Color.accentColor.opacity(0.35), radius: 8, y: 2)
+                    .opacity(hovering ? 1 : 0)
+            }
         } else {
             Capsule()
                 .fill(QuerySurface.controlFill(hovering: hovering))

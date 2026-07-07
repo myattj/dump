@@ -18,7 +18,7 @@ final class CustomLLMClassifierTests: XCTestCase {
     func testParsesJSONReply() async throws {
         let transport = MockHTTPTransport()
         let inner = """
-        {"type":"reminder","title":"Stand up","tags":["meeting"],"scheduled_at":"2026-05-16T09:00:00Z","deadline_at":"2026-05-16T09:30:00Z","effort_minutes":10,"metadata_confidence":0.9}
+        {"type":"reminder","title":"Stand up","tags":["meeting"],"scheduled_at":"2026-05-16T09:00:00Z","deadline_at":"2026-05-16T09:30:00Z","effort_minutes":10,"importance":2,"metadata_confidence":0.9}
         """
         transport.stub(path: "/v1/chat/completions", json: [
             "choices": [["message": ["role": "assistant", "content": inner]]]
@@ -37,6 +37,7 @@ final class CustomLLMClassifierTests: XCTestCase {
         XCTAssertNotNil(result.scheduledAt)
         XCTAssertNotNil(result.deadlineAt)
         XCTAssertEqual(result.effortMinutes, 10)
+        XCTAssertEqual(result.importance, 2)
         XCTAssertEqual(result.metadataConfidence, 0.9)
     }
 

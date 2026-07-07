@@ -45,7 +45,11 @@ public final class SystemProcessLauncher: ProcessLaunching, @unchecked Sendable 
         let handle = pipe.fileHandleForReading
         handle.readabilityHandler = { fileHandle in
             let data = fileHandle.availableData
-            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            guard !data.isEmpty else {
+                fileHandle.readabilityHandler = nil
+                return
+            }
+            guard let chunk = String(data: data, encoding: .utf8) else { return }
             for line in chunk.split(whereSeparator: { $0.isNewline }) {
                 onLine(String(line))
             }

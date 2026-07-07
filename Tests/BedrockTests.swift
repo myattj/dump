@@ -22,7 +22,7 @@ final class BedrockClassifierTests: XCTestCase {
                         "role": "assistant",
                         "content": [[
                             "text": """
-                            {"type":"reminder","title":"Stand up","tags":["health"],"scheduled_at":"2026-05-16T09:00:00Z","deadline_at":"2026-05-16T09:30:00Z","effort_minutes":10,"metadata_confidence":0.9}
+                            {"type":"reminder","title":"Stand up","tags":["health"],"scheduled_at":"2026-05-16T09:00:00Z","deadline_at":"2026-05-16T09:30:00Z","effort_minutes":10,"importance":9,"metadata_confidence":0.9}
                             """
                         ]]
                     ]
@@ -49,6 +49,8 @@ final class BedrockClassifierTests: XCTestCase {
         XCTAssertNotNil(result.scheduledAt)
         XCTAssertNotNil(result.deadlineAt)
         XCTAssertEqual(result.effortMinutes, 10)
+        // Out-of-range model output clamps onto the 1…4 scale.
+        XCTAssertEqual(result.importance, 4)
         XCTAssertEqual(result.metadataConfidence, 0.9)
     }
 

@@ -47,10 +47,17 @@ public final class CaptureWindowController {
     }
 
     public func close() {
+        close(intent: .cancelled)
+    }
+
+    /// Submit passes `.committed` so the panel lifts up-and-away along its
+    /// entrance axis — the note visibly leaves as "sent". Esc and click-away
+    /// keep the neutral exit. Same speed either way: zero added latency.
+    func close(intent: PanelDismissIntent) {
         isShowing = false
         guard let panel, !hideInFlight else { return }
         hideInFlight = true
-        PanelAnimator.hide(panel) { [weak self] in
+        PanelAnimator.hide(panel, intent: intent) { [weak self] in
             guard let self else { return }
             self.hideInFlight = false
             if self.isShowing {
@@ -67,11 +74,16 @@ public final class CaptureWindowController {
             panel = Self.makePanel(
                 focusRequest: focusRequest,
                 onSubmit: onSubmit,
-                onClose: { [weak self] in self?.close() }
+                onClose: { [weak self] in self?.close() },
+                onCommitClose: { [weak self] in self?.close(intent: .committed) }
             )
         }
         guard let panel else { return }
-        panel.center()
+        // A re-show that interrupts the hide retargets in place instead of
+        // teleporting the still-visible panel to center.
+        if !panel.isVisible {
+            panel.center()
+        }
         NSApp.activate(ignoringOtherApps: true)
         PanelAnimator.show(panel)
         focusRequest.request()
@@ -80,9 +92,15 @@ public final class CaptureWindowController {
     private static func makePanel(
         focusRequest: PanelFocusRequest,
         onSubmit: @escaping Submit,
-        onClose: @escaping @MainActor () -> Void
+        onClose: @escaping @MainActor () -> Void,
+        onCommitClose: @escaping @MainActor () -> Void
     ) -> NSPanel {
-        let view = CaptureView(focusRequest: focusRequest, onSubmit: onSubmit, onCancel: onClose)
+        let view = CaptureView(
+            focusRequest: focusRequest,
+            onSubmit: onSubmit,
+            onCancel: onClose,
+            onCommitClose: onCommitClose
+        )
         let host = NSHostingController(rootView: view)
         DumpWindowChrome.prepareHost(host, style: .capture)
 
@@ -104,9 +122,12 @@ struct CaptureView: View {
     @ObservedObject var focusRequest: PanelFocusRequest
     let onSubmit: CaptureWindowController.Submit
     let onCancel: @MainActor () -> Void
+    let onCommitClose: @MainActor () -> Void
 
     @State private var text: String = ""
-    @State private var headerBounce: Int = 0
+    /// Set on submit: the text stays visible through the "sent" exit (it's
+    /// what sells the lift-away), then clears on the next presentation.
+    @State private var clearOnNextPresent = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -114,19 +135,52 @@ struct CaptureView: View {
             VStack(alignment: .leading, spacing: 0) {
                 header
                 editor
+                if let preview = parsePreview {
+                    ParsePreviewStrip(preview: preview)
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 8)
+                        .transition(.opacity)
+                }
                 footer
             }
         }
-        .onAppear { headerBounce += 1 }
+        .onChange(of: focusRequest.token) { _, _ in
+            // Cancelled drafts survive a quick reopen; submitted ones don't.
+            if clearOnNextPresent {
+                text = ""
+                clearOnNextPresent = false
+            }
+        }
+        // Keyed on the minute-stable projection, not the raw preview — its
+        // Date carries sub-second precision from relative parses, which
+        // would re-key this animation on every keystroke.
+        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: parsePreview?.animationKey)
+    }
+
+    /// What the queue's extractor sees in the current text — informational
+    /// here; the same signals feed ranking once the entry is saved.
+    private var parsePreview: QueueViewModel.ParsePreview? {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return nil }
+        let metadata = QueueMetadataExtractor.extract(from: body)
+        let preview = QueueViewModel.ParsePreview(
+            date: metadata.deadlineAt ?? metadata.scheduledAt,
+            dateKind: metadata.inferredType == .reminder ? .reminder : .deadline,
+            effortMinutes: metadata.effortMinutes,
+            importance: metadata.importance
+        )
+        return preview.isEmpty ? nil : preview
     }
 
     private var header: some View {
+        // No entrance bounce here: this panel opens dozens of times a day,
+        // and the spring entrance is already the entrance motion. Symbol
+        // bounces are reserved for rare events.
         DumpPanelTitleStrip(
             iconName: "square.and.pencil",
             title: "New entry",
             height: DumpUI.Controls.compactTitleStripHeight,
-            horizontalPadding: DumpUI.Spacing.xxxl,
-            iconBounceValue: headerBounce
+            horizontalPadding: DumpUI.Spacing.xxxl
         )
     }
 
@@ -139,12 +193,18 @@ struct CaptureView: View {
                 onCancel: { onCancel() }
             )
 
-            if text.isEmpty {
-                Text("What's on your mind?")
-                    .font(.system(size: 17))
-                    .foregroundColor(Color.primary.opacity(0.35))
-                    .allowsHitTesting(false)
-            }
+            // Asymmetric on purpose: vanishes instantly on the first
+            // keystroke (typing never animates), fades back in over 100ms
+            // when the last character is deleted.
+            Text("What's on your mind?")
+                .font(.system(size: 17))
+                .foregroundColor(Color.primary.opacity(0.35))
+                .allowsHitTesting(false)
+                .opacity(text.isEmpty ? 1 : 0)
+                .animation(
+                    text.isEmpty ? resolved(Motion.micro, reduceMotion: reduceMotion) : nil,
+                    value: text.isEmpty
+                )
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 10)
@@ -160,20 +220,19 @@ struct CaptureView: View {
             keyHint("esc", "cancel")
             Spacer()
             if !text.isEmpty {
+                // The count itself must never animate — it changes per
+                // keystroke. Only its appearance/disappearance (an
+                // isEmpty boundary) gets a 100ms fade.
                 Text("\(text.count)")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(.tertiary)
-                    .contentTransition(.numericText(countsDown: false))
-                    .transition(.asymmetric(
-                        insertion: .opacity.combined(with: .scale(scale: 0.7, anchor: .trailing)),
-                        removal: .opacity
-                    ))
+                    .transition(.opacity)
             }
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
         .background(.quaternary.opacity(0.4))
-        .animation(resolved(Motion.bouncy, reduceMotion: reduceMotion), value: text.isEmpty)
+        .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: text.isEmpty)
     }
 
     private func keyHint(_ key: String, _ action: String) -> some View {
@@ -213,8 +272,10 @@ struct CaptureView: View {
             onCancel()
             return
         }
-        text = ""
-        onCancel()
+        // Keep the text on screen through the committed exit — the note
+        // visibly lifts away as "sent". It clears on the next presentation.
+        clearOnNextPresent = true
+        onCommitClose()
         Task { await onSubmit(body) }
     }
 }

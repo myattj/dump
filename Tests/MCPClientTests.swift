@@ -12,6 +12,9 @@ final class MCPClientTests: XCTestCase {
         let transport = MockHTTPTransport()
         let captured = OSAllocatedUnfairLock<Data?>(initialState: nil)
         transport.setFallback { req in
+            if req.url.path == "/health" {
+                return HTTPResponse(status: 200)
+            }
             if req.url.path == "/mcp" {
                 let isInitialize = req.body.flatMap {
                     String(data: $0, encoding: .utf8)?.contains("\"method\":\"initialize\"")

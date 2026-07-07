@@ -101,28 +101,56 @@ public actor MCPClient: QMDClienting {
 
     private func call(tool: String, arguments: [String: AnyEncodable]) async throws -> CallEnvelope {
         guard let port = await daemon.currentPort() else { throw QMDClientError.daemonUnavailable }
-        try await ensureSession(port: port)
-
-        // Flatten AnyEncodable to JSON-serializable Any before handing off — if we
-        // nest AnyEncodable inside another AnyEncodable, the inner `encode(to:)`
-        // base64-encodes its payload and qmd silently returns no hits.
-        let argsAny = try arguments.mapValues { try $0.toJSONObject() }
-        let body = try jsonRPCRaw(
-            method: "tools/call",
-            params: [
-                "name": tool,
-                "arguments": argsAny,
-            ]
-        )
-        let resp = try await postMCP(port: port, body: body, expectSession: true)
-        // qmd may invalidate the cached session if it restarted; one retry is fine.
-        if resp.status == 404 || resp.status == 400 {
-            sessionID = nil
+        DiagnosticLog.event(.debug, category: "mcp", "calling qmd tool", metadata: [
+            "tool": tool,
+            "port": String(port),
+        ])
+        do {
             try await ensureSession(port: port)
-            let retried = try await postMCP(port: port, body: body, expectSession: true)
-            return try parseEnvelope(retried)
+
+            // Flatten AnyEncodable to JSON-serializable Any before handing off — if we
+            // nest AnyEncodable inside another AnyEncodable, the inner `encode(to:)`
+            // base64-encodes its payload and qmd silently returns no hits.
+            let argsAny = try arguments.mapValues { try $0.toJSONObject() }
+            let body = try jsonRPCRaw(
+                method: "tools/call",
+                params: [
+                    "name": tool,
+                    "arguments": argsAny,
+                ]
+            )
+            let resp = try await postMCP(port: port, body: body, expectSession: true)
+            // qmd may invalidate the cached session if it restarted; one retry is fine.
+            if resp.status == 404 || resp.status == 400 {
+                DiagnosticLog.event(.warning, category: "mcp", "cached session rejected", metadata: [
+                    "tool": tool,
+                    "port": String(port),
+                    "status": String(resp.status),
+                ])
+                sessionID = nil
+                try await ensureSession(port: port)
+                let retried = try await postMCP(port: port, body: body, expectSession: true)
+                let envelope = try parseEnvelope(retried)
+                DiagnosticLog.event(.debug, category: "mcp", "qmd tool completed after retry", metadata: [
+                    "tool": tool,
+                    "port": String(port),
+                ])
+                return envelope
+            }
+            let envelope = try parseEnvelope(resp)
+            DiagnosticLog.event(.debug, category: "mcp", "qmd tool completed", metadata: [
+                "tool": tool,
+                "port": String(port),
+            ])
+            return envelope
+        } catch {
+            DiagnosticLog.event(.error, category: "mcp", "qmd tool failed", metadata: [
+                "tool": tool,
+                "port": String(port),
+                "error": String(describing: error),
+            ])
+            throw error
         }
-        return try parseEnvelope(resp)
     }
 
     private func ensureSession(port: Int) async throws {
@@ -154,6 +182,10 @@ public actor MCPClient: QMDClienting {
         let notifyBody = try jsonRPCRaw(method: "notifications/initialized", params: nil, includeID: false)
         _ = try await postMCP(port: port, body: notifyBody, expectSession: true)
         log.debug("mcp session \(sid, privacy: .public) on port \(port, privacy: .public)")
+        DiagnosticLog.event(.debug, category: "mcp", "initialized session", metadata: [
+            "port": String(port),
+            "session": String(sid.prefix(8)),
+        ])
     }
 
     private func postMCP(port: Int, body: Data, expectSession: Bool) async throws -> HTTPResponse {

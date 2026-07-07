@@ -32,6 +32,10 @@ trap 'rm -rf "$STAGE_DIR"' EXIT
 mkdir -p "$OUTPUT_DIR"
 
 log() { printf '\033[33m[notarize]\033[0m %s\n' "$*" >&2; }
+die() {
+  printf '\033[31m[notarize]\033[0m %s\n' "$*" >&2
+  exit 1
+}
 
 log "staging app for DMG"
 cp -R "$APP_PATH" "$STAGE_DIR/"
@@ -56,10 +60,29 @@ codesign --force \
          --timestamp \
          "$DMG_PATH"
 
+SUBMIT_JSON="$(mktemp)"
+LOG_JSON="$(mktemp)"
+trap 'rm -rf "$STAGE_DIR" "$SUBMIT_JSON" "$LOG_JSON"' EXIT
+
 log "submitting to Apple (this typically takes 1–5 minutes)"
 xcrun notarytool submit "$DMG_PATH" \
                   --keychain-profile "$NOTARY_PROFILE" \
-                  --wait
+                  --wait \
+                  --output-format json | tee "$SUBMIT_JSON"
+
+SUBMISSION_ID="$(/usr/bin/plutil -extract id raw "$SUBMIT_JSON" 2>/dev/null || true)"
+STATUS="$(/usr/bin/plutil -extract status raw "$SUBMIT_JSON" 2>/dev/null || true)"
+
+if [[ "$STATUS" != "Accepted" ]]; then
+  log "notarization status: ${STATUS:-unknown}"
+  if [[ -n "$SUBMISSION_ID" ]]; then
+    log "fetching Apple notary log for $SUBMISSION_ID"
+    xcrun notarytool log "$SUBMISSION_ID" \
+                    --keychain-profile "$NOTARY_PROFILE" \
+                    --output-format json | tee "$LOG_JSON"
+  fi
+  die "notarization failed; not stapling $DMG_PATH"
+fi
 
 log "stapling ticket"
 xcrun stapler staple "$DMG_PATH"

@@ -60,6 +60,32 @@ final class CaptureCoordinatorTests: XCTestCase {
         XCTAssertTrue(raw.contains("remind me to take vitamins"))
     }
 
+    func testQuickCaptureFallsBackToLocalQueueMetadataWhenClassifierFails() async throws {
+        let failingHub = ClassifierHub(
+            keychain: KeychainStore(service: "cap.\(UUID())"),
+            defaults: UserDefaults(suiteName: "cap-hub.\(UUID())")!,
+            claude: ThrowingCaptureClassifier(),
+            ollama: ThrowingCaptureClassifier()
+        )
+        let coordinator = CaptureCoordinator(
+            storage: storage,
+            writer: MarkdownWriter(),
+            classifier: failingHub,
+            scheduler: scheduler,
+            daemon: daemon
+        )
+
+        await coordinator.handleSubmission(body: "send invoice tomorrow 15m", source: .capture)
+
+        let inbox = storage.subdirectory(.inbox)
+        let files = try FileManager.default.contentsOfDirectory(at: inbox, includingPropertiesForKeys: nil)
+        XCTAssertEqual(files.count, 1)
+        let raw = try String(contentsOf: files[0], encoding: .utf8)
+        XCTAssertTrue(raw.contains("type: task"))
+        XCTAssertTrue(raw.contains("deadline_at:"))
+        XCTAssertTrue(raw.contains("effort_minutes: 15"))
+    }
+
     func testMeetingCaptureUsesMeetingDirectoryAndType() async throws {
         let coordinator = CaptureCoordinator(
             storage: storage,
@@ -82,5 +108,13 @@ struct StubClassifier: Classifier {
     let identifier = "stub"
     func classify(_ text: String, now: Date) async throws -> ClassifierResult {
         ClassifierResult(type: .reminder, title: "stubbed", tags: ["t"], scheduledAt: nil)
+    }
+}
+
+struct ThrowingCaptureClassifier: Classifier {
+    let identifier = "throwing"
+
+    func classify(_ text: String, now: Date) async throws -> ClassifierResult {
+        throw NSError(domain: "capture", code: 1)
     }
 }

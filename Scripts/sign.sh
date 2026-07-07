@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Codesigns the bundled runtime (Node + every .node native module) and then
-# the Dump.app outer bundle with hardened runtime + the entitlements file.
+# Codesigns the bundled runtime (Node + every native module/helper binary) and
+# then the Dump.app outer bundle with hardened runtime + the entitlements file.
 #
 # Required env:
 #   DEVELOPER_ID         e.g. "Developer ID Application: Josh Myatt (TEAMID)"
@@ -31,34 +31,32 @@ log() { printf '\033[35m[sign]\033[0m %s\n' "$*" >&2; }
 
 codesign_one() {
   local file="$1"
+  shift || true
   codesign --force \
            --sign "$DEVELOPER_ID" \
            --options runtime \
            --timestamp \
+           "$@" \
            "$file"
 }
 
-# Inside-out signing: every Mach-O binary in the runtime first, then the app.
-log "signing every .node native module"
-while IFS= read -r -d '' nodemod; do
-  codesign_one "$nodemod"
-done < <(find "$RUNTIME_INSIDE_APP" -type f -name "*.node" -print0)
+codesign_node() {
+  local file="$1"
+  codesign_one "$file" --entitlements "$ENTITLEMENTS"
+}
 
-log "signing every .dylib in the runtime"
-while IFS= read -r -d '' dylib; do
-  codesign_one "$dylib"
-done < <(find "$RUNTIME_INSIDE_APP" -type f -name "*.dylib" -print0)
-
-log "signing the bundled node binary"
-codesign_one "$RUNTIME_INSIDE_APP/node/bin/node"
-
-# Catch any other Mach-O slices we missed (e.g. helper executables in npm
-# native module postinstall outputs).
-log "sweeping for any remaining unsigned Mach-O binaries"
+# Inside-out signing: force-sign every Mach-O binary in the runtime first, then
+# the app. Some npm packages ship .so files that are already ad-hoc signed; a
+# plain `codesign -v` check passes locally, but Apple rejects them because they
+# are not Developer ID signed with a secure timestamp.
+log "signing every Mach-O binary in the runtime"
 while IFS= read -r -d '' candidate; do
-  if file -b "$candidate" | grep -q "Mach-O" && ! codesign -v "$candidate" >/dev/null 2>&1; then
-    log "signing leftover $candidate"
-    codesign_one "$candidate"
+  if file -b "$candidate" | grep -q "Mach-O"; then
+    if [[ "$candidate" == "$RUNTIME_INSIDE_APP/node/bin/node" ]]; then
+      codesign_node "$candidate"
+    else
+      codesign_one "$candidate"
+    fi
   fi
 done < <(find "$RUNTIME_INSIDE_APP" -type f -print0)
 

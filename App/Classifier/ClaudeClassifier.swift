@@ -66,6 +66,7 @@ public struct ClaudeClassifier: Classifier {
             scheduledAt: input.scheduledAt.flatMap { ISO8601DateFormatter.anthropic.date(from: $0) },
             deadlineAt: input.deadlineAt.flatMap { ISO8601DateFormatter.anthropic.date(from: $0) },
             effortMinutes: input.effortMinutes,
+            importance: ClassifierResult.normalizedImportance(input.importance),
             metadataConfidence: input.metadataConfidence
         )
     }
@@ -88,7 +89,9 @@ public struct ClaudeClassifier: Classifier {
         notification fire times. Set deadline_at for due dates, target dates,
         or natural task timing used for queue ordering. Estimate effort_minutes
         from phrases like "quick", "deep work", "15m", "two hours"; omit it if
-        unclear. Give metadata_confidence from 0.0 to 1.0, a tight ≤60-char
+        unclear. Set importance from 1 (low) to 4 (critical) only when the text
+        signals priority — urgency words, stakes, or explicit emphasis; omit it
+        when neutral. Give metadata_confidence from 0.0 to 1.0, a tight ≤60-char
         title, and up to 5 lowercase tags. Call the classify_entry tool exactly
         once.
         """
@@ -134,6 +137,7 @@ public struct ClaudeClassifier: Classifier {
                         "scheduled_at": .init(type: "string", description: "ISO-8601 reminder notification time if explicit, else omit."),
                         "deadline_at": .init(type: "string", description: "ISO-8601 task deadline/target time if present, else omit."),
                         "effort_minutes": .init(type: "integer", description: "Estimated effort in minutes if inferable."),
+                        "importance": .init(type: "integer", description: "1 low … 4 critical; omit when the text signals no priority."),
                         "metadata_confidence": .init(type: "number", description: "Confidence from 0.0 to 1.0."),
                     ],
                     required: ["type"]
@@ -177,9 +181,10 @@ public struct ClaudeClassifier: Classifier {
             let scheduledAt: String?
             let deadlineAt: String?
             let effortMinutes: Int?
+            let importance: Int?
             let metadataConfidence: Double?
             enum CodingKeys: String, CodingKey {
-                case type, title, tags
+                case type, title, tags, importance
                 case scheduledAt = "scheduled_at"
                 case deadlineAt = "deadline_at"
                 case effortMinutes = "effort_minutes"

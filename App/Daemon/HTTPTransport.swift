@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// Minimal JSON HTTP client used by every outbound integration. Defined as
 /// a protocol so tests inject a stub instead of touching the network.
@@ -43,6 +44,8 @@ public enum HTTPError: Error, Equatable {
 
 /// Production implementation backed by `URLSession`.
 public struct HTTPTransport: HTTPTransporting {
+    private static let log = Logger(subsystem: DiagnosticLog.subsystem, category: "network")
+
     private let session: URLSession
 
     public init(session: URLSession = .shared) {
@@ -50,19 +53,122 @@ public struct HTTPTransport: HTTPTransporting {
     }
 
     public func send(_ request: HTTPRequest) async throws -> HTTPResponse {
+        let requestID = Self.requestID()
+        let diagnostics = Self.diagnostics(for: request)
+        let startedAt = Date()
+        Self.log.debug("http start id=\(requestID, privacy: .public) category=\(diagnostics.category, privacy: .public) method=\(request.method, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public)")
+        DiagnosticLog.network(NetworkDiagnosticRecord(
+            date: startedAt,
+            id: requestID,
+            phase: .started,
+            category: diagnostics.category,
+            method: request.method,
+            url: diagnostics.redactedURL,
+            host: diagnostics.host,
+            path: diagnostics.path,
+            requestBytes: request.body?.count
+        ))
+
         var req = URLRequest(url: request.url)
         req.httpMethod = request.method
         req.httpBody = request.body
         req.timeoutInterval = request.timeout
         for (k, v) in request.headers { req.setValue(v, forHTTPHeaderField: k) }
-        let (data, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw HTTPError.malformedResponse
+
+        do {
+            let (data, response) = try await session.data(for: req)
+            let durationMS = Self.durationMS(since: startedAt)
+            guard let http = response as? HTTPURLResponse else {
+                Self.log.error("http malformed id=\(requestID, privacy: .public) method=\(request.method, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public) duration_ms=\(durationMS, privacy: .public)")
+                throw HTTPError.malformedResponse
+            }
+            let headers = http.allHeaderFields.reduce(into: [String: String]()) { acc, pair in
+                if let k = pair.key as? String, let v = pair.value as? String { acc[k] = v }
+            }
+            DiagnosticLog.network(NetworkDiagnosticRecord(
+                id: requestID,
+                phase: .finished,
+                category: diagnostics.category,
+                method: request.method,
+                url: diagnostics.redactedURL,
+                host: diagnostics.host,
+                path: diagnostics.path,
+                status: http.statusCode,
+                durationMS: durationMS,
+                requestBytes: request.body?.count,
+                responseBytes: data.count
+            ))
+            Self.log.info("http finish id=\(requestID, privacy: .public) status=\(http.statusCode, privacy: .public) method=\(request.method, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public) duration_ms=\(durationMS, privacy: .public) response_bytes=\(data.count, privacy: .public)")
+            return HTTPResponse(status: http.statusCode, headers: headers, body: data)
+        } catch {
+            let durationMS = Self.durationMS(since: startedAt)
+            let nsError = error as NSError
+            DiagnosticLog.network(NetworkDiagnosticRecord(
+                id: requestID,
+                phase: .failed,
+                category: diagnostics.category,
+                method: request.method,
+                url: diagnostics.redactedURL,
+                host: diagnostics.host,
+                path: diagnostics.path,
+                durationMS: durationMS,
+                requestBytes: request.body?.count,
+                errorDomain: nsError.domain,
+                errorCode: nsError.code,
+                errorDescription: nsError.localizedDescription
+            ))
+            Self.log.error("http failed id=\(requestID, privacy: .public) method=\(request.method, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public) duration_ms=\(durationMS, privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public) error=\(nsError.localizedDescription, privacy: .public)")
+            throw error
         }
-        let headers = http.allHeaderFields.reduce(into: [String: String]()) { acc, pair in
-            if let k = pair.key as? String, let v = pair.value as? String { acc[k] = v }
+    }
+
+    private struct RequestDiagnostics {
+        let redactedURL: String
+        let host: String
+        let path: String
+        let category: String
+    }
+
+    private static func diagnostics(for request: HTTPRequest) -> RequestDiagnostics {
+        let host = request.url.host ?? ""
+        let path = request.url.path.isEmpty ? "/" : request.url.path
+        return RequestDiagnostics(
+            redactedURL: redactedURL(request.url),
+            host: host,
+            path: path,
+            category: category(host: host, path: path)
+        )
+    }
+
+    private static func redactedURL(_ url: URL) -> String {
+        let scheme = url.scheme.map { "\($0)://" } ?? ""
+        let host = url.host ?? ""
+        let port = url.port.map { ":\($0)" } ?? ""
+        let path = url.path.isEmpty ? "/" : url.path
+        let query = url.query == nil ? "" : "?<redacted>"
+        return "\(scheme)\(host)\(port)\(path)\(query)"
+    }
+
+    private static func category(host: String, path: String) -> String {
+        let lowerHost = host.lowercased()
+        if lowerHost == "localhost" || lowerHost == "127.0.0.1" || lowerHost == "::1" {
+            if path == "/health" { return "qmd.health" }
+            if path == "/mcp" { return "qmd.mcp" }
+            if path.hasPrefix("/api/") { return "ollama" }
+            return "local"
         }
-        return HTTPResponse(status: http.statusCode, headers: headers, body: data)
+        if lowerHost.contains("anthropic") { return "anthropic" }
+        if lowerHost.contains("openai") { return "openai" }
+        if lowerHost.contains("bedrock") || lowerHost.contains("amazonaws.com") { return "bedrock" }
+        return "custom"
+    }
+
+    private static func requestID() -> String {
+        String(UUID().uuidString.prefix(8)).lowercased()
+    }
+
+    private static func durationMS(since startedAt: Date) -> Int {
+        max(0, Int(Date().timeIntervalSince(startedAt) * 1000))
     }
 }
 

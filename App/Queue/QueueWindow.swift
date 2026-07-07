@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Wave
 
 @MainActor
 public final class QueueWindowController: NSObject, NSWindowDelegate {
@@ -71,6 +72,11 @@ public final class QueueWindowController: NSObject, NSWindowDelegate {
 
     public func togglePinned() {
         isPinned.toggle()
+        // Physical acknowledgment: pinning dips the panel a couple of points
+        // and springs back — it visibly "anchors" itself.
+        if isPinned, let panel {
+            PanelAnimator.nudge(panel)
+        }
     }
 
     private func presentPanel() {
@@ -91,7 +97,12 @@ public final class QueueWindowController: NSObject, NSWindowDelegate {
             updatePanelBehavior()
         }
         guard let panel else { return }
-        position(panel)
+        // Only reposition when the panel is actually off-screen — a re-show
+        // that interrupts the hide animation retargets in place instead of
+        // teleporting the still-visible window.
+        if !panel.isVisible {
+            position(panel)
+        }
         NSApp.activate(ignoringOtherApps: true)
         PanelAnimator.show(panel)
         focusRequest.request()
@@ -118,6 +129,7 @@ public final class QueueWindowController: NSObject, NSWindowDelegate {
 
     private func updatePanelBehavior() {
         guard let panel else { return }
+        panel.level = isPinned ? .normal : .floating
         panel.collectionBehavior = isPinned
             ? [.canJoinAllSpaces, .fullScreenAuxiliary]
             : [.transient, .fullScreenAuxiliary]
@@ -154,6 +166,8 @@ struct QueueView: View {
     let onTogglePinned: @MainActor () -> Void
 
     @FocusState private var inputFocused: Bool
+    @State private var laterExpanded = false
+    @State private var emptyStateBounce = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -169,7 +183,18 @@ struct QueueView: View {
             if let toast = viewModel.undoToast {
                 undoToast(toast)
                     .padding(.bottom, 14)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    // Sonner grammar: springs up from the bottom edge with a
+                    // slight settle (driven by Motion.panel at the mutation
+                    // site), accelerates away on the exit curve when done.
+                    .transition(reducedTransition(
+                        .asymmetric(
+                            insertion: .move(edge: .bottom)
+                                .combined(with: .scale(scale: 0.96, anchor: .bottom))
+                                .combined(with: .opacity),
+                            removal: .offset(y: 12).combined(with: .opacity)
+                        ),
+                        reduceMotion: reduceMotion
+                    ))
             }
         }
         .onAppear { requestInputFocus() }
@@ -181,17 +206,36 @@ struct QueueView: View {
             return .handled
         }
         .onKeyPress(.downArrow) {
-            viewModel.selectNext()
+            // Key-repeat path: selection moves on the 100ms micro curve only.
+            withAnimation(resolved(Motion.micro, reduceMotion: reduceMotion)) {
+                viewModel.selectNext()
+            }
             return .handled
         }
         .onKeyPress(.upArrow) {
-            viewModel.selectPrevious()
+            withAnimation(resolved(Motion.micro, reduceMotion: reduceMotion)) {
+                viewModel.selectPrevious()
+            }
             return .handled
         }
         .task { await viewModel.refresh() }
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.items)
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.selectedID)
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.undoToast)
+        .onChange(of: viewModel.items.isEmpty) { wasEmpty, isEmpty in
+            // One earned bounce when the user clears the last item — never
+            // on first load, never looping. Lives on the body (always
+            // mounted) so it observes the flip that mounts the empty state.
+            if isEmpty && !wasEmpty {
+                emptyStateBounce += 1
+            }
+        }
+        .onChange(of: viewModel.selectedID) { _, id in
+            // Keyboard selection can walk into the Later bucket; reveal the
+            // section so the selection never lands on an invisible row.
+            guard let id, !laterExpanded,
+                  viewModel.laterItems.contains(where: { $0.id == id }) else { return }
+            withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
+                laterExpanded = true
+            }
+        }
         .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.isPinned)
     }
 
@@ -211,6 +255,7 @@ struct QueueView: View {
             Button(viewModel.isPinned ? "Unpin queue" : "Keep queue open", systemImage: viewModel.isPinned ? "pin.fill" : "pin", action: onTogglePinned)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(viewModel.isPinned ? Color.accentColor : Color.secondary)
+                .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
                 .frame(width: DumpUI.Controls.iconButton.width, height: DumpUI.Controls.iconButton.height)
                 .labelStyle(.iconOnly)
                 .buttonStyle(PressableButtonStyle(pressedScale: 0.88))
@@ -223,15 +268,45 @@ struct QueueView: View {
                 .buttonStyle(PressableButtonStyle(pressedScale: 0.88))
                 .help("Close")
             }
+            // Count-keyed (not items-keyed) so the badge's numericText rolls
+            // on add/complete but reorders don't touch the strip.
+            .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.items.count)
     }
 
     private var composer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            composerField
+            if let preview = viewModel.preview(), !preview.isEmpty {
+                ParsePreviewStrip(
+                    preview: preview,
+                    onToggleDateKind: { viewModel.toggleDateKind() },
+                    onClear: { viewModel.suppress($0) }
+                )
+                .padding(.horizontal, 4)
+                .transition(reducedTransition(
+                    .asymmetric(
+                        insertion: .opacity.combined(with: .move(edge: .top)),
+                        removal: .opacity
+                    ),
+                    reduceMotion: reduceMotion
+                ))
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.bottom, 14)
+        // Keyed on the minute-stable projection, not the raw preview — its
+        // Date carries sub-second precision from "in 30 minutes"-style
+        // parses, which would re-key this animation on every keystroke.
+        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.preview()?.animationKey)
+    }
+
+    private var composerField: some View {
         LiquidGlassGroup {
             HStack(spacing: 10) {
                 Image(systemName: viewModel.isSubmitting ? "sparkles" : "plus")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(viewModel.isSubmitting ? Color.accentColor : Color.primary.opacity(0.7))
-                    .symbolEffect(.variableColor.iterative.reversing, options: .repeating, isActive: viewModel.isSubmitting)
+                    .symbolEffect(.variableColor.iterative.reversing, options: .repeating, isActive: viewModel.isSubmitting && !reduceMotion)
                     .frame(width: 18)
 
                 TextField(
@@ -253,14 +328,14 @@ struct QueueView: View {
 
                 if !viewModel.input.isEmpty {
                     Button("Clear queue item", systemImage: "xmark.circle.fill") {
-                        viewModel.input = ""
+                        viewModel.clearComposer()
                         inputFocused = true
                     }
                     .font(.system(size: 13))
                     .foregroundStyle(Color.primary.opacity(0.52))
                     .labelStyle(.iconOnly)
                     .buttonStyle(PressableButtonStyle(pressedScale: 0.86))
-                    .transition(.scale(scale: 0.7).combined(with: .opacity))
+                    .transition(clearButtonTransition(reduceMotion: reduceMotion))
                 }
 
                 Button("Add to queue", systemImage: "arrow.up.circle.fill") {
@@ -287,6 +362,11 @@ struct QueueView: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(Color.accentColor.opacity(inputFocused ? 0.42 : 0.14), lineWidth: 1)
             )
+            .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: inputFocused)
+            // Keyed on .isEmpty, not the text — fires exactly twice per
+            // compose cycle (first character, clear/submit), never per
+            // keystroke.
+            .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: viewModel.input.isEmpty)
         }
         .padding(.horizontal, 18)
         .padding(.bottom, 14)
@@ -294,40 +374,130 @@ struct QueueView: View {
 
     @ViewBuilder
     private var content: some View {
-        if viewModel.isLoading && viewModel.items.isEmpty {
-            loadingState
-        } else if let error = viewModel.error, viewModel.items.isEmpty {
-            errorState(error)
-        } else if viewModel.items.isEmpty {
-            emptyState
-        } else {
-            list
+        Group {
+            if viewModel.isLoading && viewModel.items.isEmpty {
+                loadingState
+            } else if let error = viewModel.error, viewModel.items.isEmpty {
+                errorState(error)
+            } else if viewModel.items.isEmpty {
+                emptyState
+                    .transition(reducedTransition(
+                        .scale(scale: 0.94).combined(with: .opacity),
+                        reduceMotion: reduceMotion
+                    ))
+            } else {
+                list
+            }
         }
+        // Fires at most once per submit/complete — drives the list ↔
+        // empty-state swap with a hint of overshoot (the reward moment).
+        .animation(resolved(Motion.bouncy, reduceMotion: reduceMotion), value: viewModel.items.isEmpty)
+    }
+
+    /// Removal direction mirrors what happened: completed rows exit right
+    /// (continuous with the swipe), snoozed rows exit left toward Later.
+    private func rowTransition(for item: QueueItem) -> AnyTransition {
+        if reduceMotion { return .opacity }
+        let removal: AnyTransition
+        if viewModel.snoozingID == item.id {
+            removal = .offset(x: -24).combined(with: .opacity)
+        } else if viewModel.completingID == item.id {
+            removal = .offset(x: 24).combined(with: .opacity)
+        } else {
+            removal = .opacity
+        }
+        return .asymmetric(
+            insertion: .scale(scale: 0.97, anchor: .leading).combined(with: .opacity),
+            removal: removal
+        )
     }
 
     private var list: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 8) {
-                    ForEach(viewModel.items) { item in
+                    ForEach(viewModel.nowItems) { item in
                         QueueRow(
+                            viewModel: viewModel,
                             item: item,
-                            isSelected: viewModel.selectedID == item.id,
-                            onSelect: { viewModel.selectedID = item.id },
-                            onComplete: { await viewModel.complete(item) }
+                            isSelected: viewModel.selectedID == item.id
                         )
                         .id(item.id)
                         .padding(.horizontal, 18)
+                        .transition(rowTransition(for: item))
+                    }
+                    if !viewModel.laterItems.isEmpty {
+                        laterSection
                     }
                 }
                 .padding(.bottom, 20)
+                // Scoped to the list so insert/remove/reorder is the only
+                // thing this drives — never the whole panel subtree.
+                .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.items)
             }
             .scrollContentBackground(.hidden)
             .onChange(of: viewModel.selectedID) { _, id in
                 guard let id else { return }
-                withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
-                    proxy.scrollTo(id, anchor: .center)
+                // Anchor-less: scrolls the minimum distance to reveal the
+                // row and does nothing when it's already visible.
+                withAnimation(resolved(Motion.micro, reduceMotion: reduceMotion)) {
+                    proxy.scrollTo(id)
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var laterSection: some View {
+        Button {
+            withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
+                laterExpanded.toggle()
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .bold))
+                    .rotationEffect(.degrees(laterExpanded ? 90 : 0))
+                Image(systemName: "moon.zzz")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Later")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("\(viewModel.laterItems.count)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+                    .contentTransition(reduceMotion ? .opacity : .numericText(value: Double(viewModel.laterItems.count)))
+                Spacer()
+                if !laterExpanded, let next = viewModel.laterItems.first?.wakeAt {
+                    Text("next \(QueueFormat.date(next))")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                        .transition(.opacity)
+                }
+            }
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 18)
+        .padding(.top, 6)
+
+        if laterExpanded {
+            ForEach(viewModel.laterItems) { item in
+                QueueRow(
+                    viewModel: viewModel,
+                    item: item,
+                    isSelected: viewModel.selectedID == item.id
+                )
+                .id(item.id)
+                .padding(.horizontal, 18)
+                .opacity(0.75)
+                .transition(reducedTransition(
+                    .opacity.combined(with: .offset(y: -4)),
+                    reduceMotion: reduceMotion
+                ))
             }
         }
     }
@@ -347,10 +517,7 @@ struct QueueView: View {
     private var emptyState: some View {
         VStack(spacing: 12) {
             Spacer()
-            Image(systemName: "tray")
-                .font(.system(size: 34, weight: .light))
-                .foregroundStyle(.tertiary)
-                .symbolRenderingMode(.hierarchical)
+            emptyTrayIcon
             Text("Your queue is clear")
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.secondary)
@@ -358,6 +525,20 @@ struct QueueView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.bottom, 48)
+    }
+
+    @ViewBuilder
+    private var emptyTrayIcon: some View {
+        let icon = Image(systemName: "tray")
+            .font(.system(size: 34, weight: .light))
+            .foregroundStyle(.tertiary)
+            .symbolRenderingMode(.hierarchical)
+
+        if reduceMotion {
+            icon
+        } else {
+            icon.symbolEffect(.bounce.up, value: emptyStateBounce)
+        }
     }
 
     private func errorState(_ message: String) -> some View {
@@ -384,12 +565,32 @@ struct QueueView: View {
     }
 
     private var keyboardDoneButton: some View {
-        Button {
-            Task { await viewModel.completeSelected() }
-        } label: {
-            EmptyView()
+        Group {
+            Button {
+                Task { await viewModel.completeSelected() }
+            } label: {
+                EmptyView()
+            }
+            .keyboardShortcut(.return, modifiers: [.command])
+            Button {
+                Task { await viewModel.adjustSelectedImportance(by: 1) }
+            } label: {
+                EmptyView()
+            }
+            .keyboardShortcut(.upArrow, modifiers: [.command])
+            Button {
+                Task { await viewModel.adjustSelectedImportance(by: -1) }
+            } label: {
+                EmptyView()
+            }
+            .keyboardShortcut(.downArrow, modifiers: [.command])
+            Button {
+                Task { await viewModel.snoozeSelected(.tomorrow) }
+            } label: {
+                EmptyView()
+            }
+            .keyboardShortcut("s", modifiers: [.command])
         }
-        .keyboardShortcut(.return, modifiers: [.command])
         .frame(width: 0, height: 0)
         .opacity(0)
         .accessibilityHidden(true)
@@ -397,11 +598,20 @@ struct QueueView: View {
 
     private func undoToast(_ toast: QueueViewModel.UndoToast) -> some View {
         HStack(spacing: 10) {
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(.green)
-                .symbolRenderingMode(.hierarchical)
-            Text("Done")
-                .font(.system(size: 12, weight: .semibold))
+            switch toast.kind {
+            case .completed:
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+                    .symbolRenderingMode(.hierarchical)
+                Text("Done")
+                    .font(.system(size: 12, weight: .semibold))
+            case .snoozed(let until):
+                Image(systemName: "moon.zzz.fill")
+                    .foregroundStyle(.indigo)
+                    .symbolRenderingMode(.hierarchical)
+                Text("Snoozed until \(QueueFormat.date(until))")
+                    .font(.system(size: 12, weight: .semibold))
+            }
             Text(toast.title)
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
@@ -429,64 +639,338 @@ struct QueueView: View {
         .padding(.trailing, 8)
         .padding(.vertical, 8)
         .liquidGlass(in: Capsule(), interactive: true)
+        // Rasterize once before the 16pt shadow so the blur isn't recomputed
+        // per animation frame.
+        .compositingGroup()
         .shadow(color: .black.opacity(0.18), radius: 16, y: 8)
         .padding(.horizontal, 18)
+        // Hovering pauses the auto-dismiss countdown so Undo stays
+        // reachable; leaving resumes it on a short fuse.
+        .onHover { viewModel.holdUndoToast($0) }
+    }
+}
+
+/// Wave-driven physics for a queue row's horizontal swipe. The animator is
+/// stopped while the finger is down (1:1 tracking) and released with the
+/// gesture's own velocity, so settles and fly-offs continue the user's
+/// motion instead of restarting on a canned curve — and a re-grab mid-flight
+/// retargets from the row's live position instead of teleporting.
+@MainActor
+private final class RowSwipeEngine: ObservableObject {
+    private let animator: SpringAnimator<CGFloat>
+    var onValue: (@MainActor (CGFloat) -> Void)?
+    private(set) var dragBase: CGFloat = 0
+    private(set) var isDragging = false
+
+    init() {
+        animator = SpringAnimator<CGFloat>(spring: DumpUI.Motion.Swipe.settleSpring)
+        animator.valueChanged = { [weak self] value in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isDragging else {
+                    // A display-link tick enqueued before stop() can land
+                    // after a re-grab — the finger owns the value now, so
+                    // stale spring frames are dropped instead of fighting it.
+                    return
+                }
+                self.onValue?(value)
+            }
+        }
+    }
+
+    func beginDrag(from current: CGFloat) {
+        animator.stop()
+        dragBase = current
+        isDragging = true
+    }
+
+    func release(from current: CGFloat, to target: CGFloat, velocity: CGFloat) {
+        isDragging = false
+        animator.value = current
+        animator.target = target
+        animator.velocity = velocity
+        animator.start()
+    }
+
+    func cancel() {
+        animator.stop()
+        isDragging = false
     }
 }
 
 private struct QueueRow: View {
+    private enum SwipeSide {
+        case done, snooze
+    }
+
+    @ObservedObject var viewModel: QueueViewModel
     let item: QueueItem
     let isSelected: Bool
-    let onSelect: @MainActor () -> Void
-    let onComplete: @MainActor () async -> Void
 
+    // StateObject so the engine (and its Wave animator) is built once per
+    // row identity, not on every body evaluation of the parent view.
+    @StateObject private var engine = RowSwipeEngine()
     @State private var dragX: CGFloat = 0
+    @State private var rowWidth: CGFloat = 400
+    @State private var thresholdSide: SwipeSide?
     @State private var isHovering = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var isCompleting: Bool { viewModel.completingID == item.id }
+    private var isSnoozing: Bool { viewModel.snoozingID == item.id }
 
     var body: some View {
         ZStack(alignment: .leading) {
             doneRail
+            snoozeRail
             rowContent
                 .offset(x: dragX)
         }
+        .background(
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { rowWidth = proxy.size.width }
+                    .onChange(of: proxy.size.width) { _, width in
+                        rowWidth = width
+                    }
+            }
+        )
         .contentShape(RoundedRectangle(cornerRadius: 8))
-        .onTapGesture(perform: onSelect)
+        .onTapGesture { viewModel.selectedID = item.id }
         .onHover { hovering in
             isHovering = hovering
         }
-        .gesture(
-            DragGesture(minimumDistance: 12)
-                .onChanged { value in
-                    dragX = max(0, min(value.translation.width, 104))
-                }
-                .onEnded { value in
-                    let shouldComplete = value.translation.width > 76
-                    withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
-                        dragX = 0
-                    }
-                    if shouldComplete {
-                        Task { await onComplete() }
-                    }
-                }
-        )
+        .onAppear {
+            engine.onValue = { dragX = $0 }
+        }
+        .gesture(swipeGesture)
+        .contextMenu { contextMenuItems }
+        // Once committed, the leftover rail must not accept another grab or
+        // tap while the row waits to be removed.
+        .allowsHitTesting(!(isCompleting || isSnoozing))
+        .onChange(of: isCompleting) { _, active in
+            if !active { recoverIfStranded() }
+        }
+        .onChange(of: isSnoozing) { _, active in
+            if !active { recoverIfStranded() }
+        }
         .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: isHovering)
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: isSelected)
+        .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: isSelected)
+        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: isCompleting)
+        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: isSnoozing)
+    }
+
+    /// Failure/still-here path for the fly-off: if the beat ended but the
+    /// row is still mounted (store op failed, or a snoozed Later row stays
+    /// in the Later list), spring it home instead of leaving it stranded
+    /// offscreen behind a fully lit rail.
+    private func recoverIfStranded() {
+        guard !engine.isDragging, dragX != 0 else { return }
+        if reduceMotion {
+            engine.cancel()
+            dragX = 0
+        } else {
+            engine.release(from: dragX, to: 0, velocity: 0)
+        }
+        withAnimation(resolved(Motion.press, reduceMotion: reduceMotion)) {
+            thresholdSide = nil
+        }
+    }
+
+    private var swipeGesture: some Gesture {
+        DragGesture(minimumDistance: 4)
+            .onChanged { value in
+                if !engine.isDragging {
+                    // Horizontal-intent gate: sloppy clicks and vertical
+                    // pointer travel never turn into aborted swipes — the
+                    // drag only arms once it's clearly sideways.
+                    guard abs(value.translation.width) >= 8,
+                          abs(value.translation.width) > abs(value.translation.height) else { return }
+                    // Re-grab mid-flight: stop the spring where it is and
+                    // track the finger relative to the row's live position.
+                    engine.beginDrag(from: dragX)
+                }
+                dragX = rubberBanded(engine.dragBase + value.translation.width)
+                updateThresholdSide()
+            }
+            .onEnded { value in
+                guard engine.isDragging else { return }
+                // Decide by the engaged threshold state, not raw position —
+                // the haptic and lit rail already told the user "this will
+                // commit", and hysteresis means that state can outlast ±76pt.
+                let commit = thresholdSide == .done
+                let snooze = thresholdSide == .snooze
+                let velocity = value.velocity.width
+
+                if reduceMotion {
+                    engine.cancel()
+                    dragX = 0
+                    thresholdSide = nil
+                    if commit {
+                        Task { await viewModel.complete(item) }
+                    } else if snooze {
+                        Task { await viewModel.snooze(item, .tomorrow) }
+                    }
+                    return
+                }
+
+                if commit {
+                    // Fly off trailing-ward on the user's own momentum; the
+                    // row stays offscreen until the items diff removes it
+                    // (or recoverIfStranded brings it back on failure).
+                    engine.release(from: dragX, to: rowWidth + 56, velocity: velocity)
+                    Task { await viewModel.complete(item) }
+                } else if snooze {
+                    engine.release(from: dragX, to: -(rowWidth + 56), velocity: velocity)
+                    Task { await viewModel.snooze(item, .tomorrow) }
+                } else {
+                    engine.release(from: dragX, to: 0, velocity: velocity)
+                    thresholdSide = nil
+                }
+            }
+    }
+
+    /// Overdrag resistance past the swipe limit, matching scroll-edge feel.
+    private func rubberBanded(_ x: CGFloat) -> CGFloat {
+        let limit = DumpUI.Motion.Swipe.maxDrag
+        let magnitude = abs(x)
+        guard magnitude > limit else { return x }
+        let over = magnitude - limit
+        return (limit + over * DumpUI.Motion.Swipe.rubberBand) * (x < 0 ? -1 : 1)
+    }
+
+    /// Haptic tick + checkmark/moon pop the moment the drag crosses the
+    /// commit threshold — the commitment is felt before release. Engages at
+    /// `commitThreshold` but only disengages below `releaseThreshold`, so
+    /// jitter at the boundary can't machine-gun the haptic.
+    private func updateThresholdSide() {
+        let engage = DumpUI.Motion.Swipe.commitThreshold
+        let release = DumpUI.Motion.Swipe.releaseThreshold
+        let side: SwipeSide?
+        switch thresholdSide {
+        case .done:
+            side = dragX >= release ? .done : (dragX <= -engage ? .snooze : nil)
+        case .snooze:
+            side = dragX <= -release ? .snooze : (dragX >= engage ? .done : nil)
+        case nil:
+            side = dragX >= engage ? .done : (dragX <= -engage ? .snooze : nil)
+        }
+        guard side != thresholdSide else { return }
+        if side != nil {
+            NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        }
+        withAnimation(resolved(Motion.press, reduceMotion: reduceMotion)) {
+            thresholdSide = side
+        }
+    }
+
+    @ViewBuilder
+    private var contextMenuItems: some View {
+        Button("Mark done", systemImage: "checkmark.circle") {
+            Task { await viewModel.complete(item) }
+        }
+        if item.isLater {
+            Button("Wake now", systemImage: "sun.max") {
+                Task { await viewModel.wake(item) }
+            }
+        }
+        Menu("Snooze") {
+            ForEach(QueueViewModel.SnoozeOption.allCases, id: \.self) { option in
+                Button(option.label) {
+                    Task { await viewModel.snooze(item, option) }
+                }
+            }
+        }
+        Divider()
+        Menu("Importance") { importanceMenuItems }
+        Menu("Effort") { effortMenuItems }
+        Menu(item.type == .reminder ? "Remind" : "Due") { dateMenuItems }
+    }
+
+    @ViewBuilder
+    private var importanceMenuItems: some View {
+        ForEach([4, 3, 2, 1], id: \.self) { level in
+            Button {
+                Task { await viewModel.setImportance(item, to: level) }
+            } label: {
+                if item.importance == level {
+                    Label(QueueFormat.importanceLabel(level).capitalized, systemImage: "checkmark")
+                } else {
+                    Text(QueueFormat.importanceLabel(level).capitalized)
+                }
+            }
+        }
+        if item.importance != nil {
+            Divider()
+            Button("Clear priority") {
+                Task { await viewModel.setImportance(item, to: nil) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var effortMenuItems: some View {
+        ForEach([5, 15, 30, 60, 120], id: \.self) { minutes in
+            Button {
+                Task { await viewModel.setEffort(item, minutes: minutes) }
+            } label: {
+                if item.effortMinutes == minutes {
+                    Label(QueueFormat.effort(minutes), systemImage: "checkmark")
+                } else {
+                    Text(QueueFormat.effort(minutes))
+                }
+            }
+        }
+        if item.effortMinutes != nil {
+            Divider()
+            Button("Clear effort") {
+                Task { await viewModel.setEffort(item, minutes: nil) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var dateMenuItems: some View {
+        Button("Today 5pm") {
+            Task { await viewModel.setDate(item, to: Self.todayAt(17), kind: dateKind) }
+        }
+        Button("Tomorrow 9am") {
+            Task { await viewModel.setDate(item, to: QueueViewModel.SnoozeOption.tomorrow.wakeDate(), kind: dateKind) }
+        }
+        Button("Next Monday 9am") {
+            Task { await viewModel.setDate(item, to: QueueViewModel.SnoozeOption.nextWeek.wakeDate(), kind: dateKind) }
+        }
+        if item.priorityAt != nil {
+            Divider()
+            Button(item.type == .reminder ? "Make it a deadline" : "Make it a reminder") {
+                Task {
+                    await viewModel.setDate(
+                        item,
+                        to: item.priorityAt,
+                        kind: item.type == .reminder ? .deadline : .reminder
+                    )
+                }
+            }
+            Button("Clear date") {
+                Task { await viewModel.setDate(item, to: nil, kind: dateKind) }
+            }
+        }
+    }
+
+    private var dateKind: QueueViewModel.DateKind {
+        item.type == .reminder ? .reminder : .deadline
+    }
+
+    private static func todayAt(_ hour: Int, now: Date = Date()) -> Date {
+        let calendar = Calendar.current
+        let candidate = calendar.date(bySettingHour: hour, minute: 0, second: 0, of: now) ?? now
+        return candidate > now
+            ? candidate
+            : calendar.date(byAdding: .day, value: 1, to: candidate) ?? candidate
     }
 
     private var rowContent: some View {
         HStack(alignment: .top, spacing: 12) {
-            Button("Mark done", systemImage: isSelected || isHovering ? "checkmark.circle.fill" : "circle") {
-                Task { await onComplete() }
-            }
-            .font(.system(size: 18, weight: .semibold))
-            .foregroundStyle(isSelected ? Color.green : Color.secondary.opacity(0.72))
-            .symbolRenderingMode(.hierarchical)
-            .frame(width: 22, height: 22)
-            .padding(.top, 1)
-            .labelStyle(.iconOnly)
-            .buttonStyle(PressableButtonStyle(pressedScale: 0.84))
-            .help("Mark done")
+            completeButton
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -500,6 +984,7 @@ private struct QueueRow: View {
                         .font(.system(size: 11, weight: .semibold, design: .rounded))
                         .foregroundStyle(.tertiary)
                         .monospacedDigit()
+                        .help(QueueFormat.rankExplanation(for: item))
                 }
                 metadata
             }
@@ -511,12 +996,41 @@ private struct QueueRow: View {
         .overlay(rowStroke)
     }
 
+    /// The ~150ms acknowledgment beat: the circle fills into a bouncing
+    /// green checkmark (or indigo moon for snooze) the instant the action
+    /// fires, while the store IO runs — then the row departs.
+    @ViewBuilder
+    private var completeButton: some View {
+        let filled = isCompleting || isSelected || isHovering
+        let name = isSnoozing ? "moon.zzz.fill" : (filled ? "checkmark.circle.fill" : "circle")
+        let tint: Color = isCompleting ? .green : (isSnoozing ? .indigo : (isSelected ? .green : Color.secondary.opacity(0.72)))
+
+        Button("Mark done", systemImage: name) {
+            Task { await viewModel.complete(item) }
+        }
+        .font(.system(size: 18, weight: .semibold))
+        .foregroundStyle(tint)
+        .symbolRenderingMode(.hierarchical)
+        .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
+        .modifier(CompletionBounce(trigger: isCompleting, enabled: !reduceMotion))
+        .frame(width: 22, height: 22)
+        .padding(.top, 1)
+        .labelStyle(.iconOnly)
+        .buttonStyle(PressableButtonStyle(pressedScale: 0.84))
+        .help("Mark done")
+    }
+
     private var rowBackground: some View {
         let shape = RoundedRectangle(cornerRadius: 8)
 
         return shape
             .fill(QueueSurface.rowFill)
-            .overlay(shape.fill(QueueSurface.rowStateFill(isSelected: isSelected, isHovering: isHovering)))
+            .overlay(shape.fill(QueueSurface.rowStateFill(
+                isSelected: isSelected,
+                isHovering: isHovering,
+                isCompleting: isCompleting,
+                isSnoozing: isSnoozing
+            )))
     }
 
     private var rowStroke: some View {
@@ -524,83 +1038,139 @@ private struct QueueRow: View {
             .strokeBorder(isSelected ? Color.accentColor.opacity(0.45) : QueueSurface.contentStroke, lineWidth: 1)
     }
 
+    // The rails map directly to drag progress — no Animation, just the
+    // finger. Opacity ramps in over the first ~40pt, the glyph grows toward
+    // the threshold and pops (Motion.press, from updateThresholdSide) when
+    // the commit locks in.
+
     private var doneRail: some View {
-        RoundedRectangle(cornerRadius: 8)
-            .fill(Color.green.opacity(0.18))
+        let progress = max(dragX, 0)
+        return RoundedRectangle(cornerRadius: 8)
+            .fill(Color.green.opacity(thresholdSide == .done ? 0.30 : 0.18))
             .overlay(alignment: .leading) {
                 Image(systemName: "checkmark")
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(.green)
+                    .scaleEffect(railGlyphScale(progress: progress, popped: thresholdSide == .done))
+                    .offset(x: min(progress * 0.12, 8))
                     .padding(.leading, 18)
             }
-            .opacity(dragX > 8 ? 1 : 0)
+            .opacity(railOpacity(progress: progress))
+    }
+
+    private var snoozeRail: some View {
+        let progress = max(-dragX, 0)
+        return RoundedRectangle(cornerRadius: 8)
+            .fill(Color.indigo.opacity(thresholdSide == .snooze ? 0.30 : 0.18))
+            .overlay(alignment: .trailing) {
+                Image(systemName: "moon.zzz.fill")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.indigo)
+                    .scaleEffect(railGlyphScale(progress: progress, popped: thresholdSide == .snooze))
+                    .offset(x: -min(progress * 0.12, 8))
+                    .padding(.trailing, 18)
+            }
+            .opacity(railOpacity(progress: progress))
+    }
+
+    private func railOpacity(progress: CGFloat) -> CGFloat {
+        min(max((progress - 8) / 32, 0), 1)
+    }
+
+    private func railGlyphScale(progress: CGFloat, popped: Bool) -> CGFloat {
+        let grown = 0.7 + 0.3 * min(progress / DumpUI.Motion.Swipe.commitThreshold, 1)
+        return popped ? grown * 1.15 : grown
     }
 
     private var metadata: some View {
         HStack(spacing: 6) {
+            if item.isLater, let wake = item.wakeAt {
+                chipMenu {
+                    snoozeMenuChoices
+                } label: {
+                    ChipLabel(icon: "moon.zzz", text: "until \(QueueFormat.date(wake))", color: .indigo)
+                }
+                .help("Snoozed — right-click the row to wake it")
+            }
             if let date = item.priorityAt {
-                chip(icon: item.deadlineAt == nil ? "bell" : "calendar", text: formatted(date), color: dueColor(date))
+                chipMenu {
+                    dateMenuItems
+                } label: {
+                    ChipLabel(
+                        icon: item.deadlineAt == nil ? "bell" : "calendar",
+                        text: QueueFormat.date(date),
+                        color: QueueFormat.dueColor(date)
+                    )
+                }
+            } else if isHovering || isSelected {
+                chipMenu {
+                    dateMenuItems
+                } label: {
+                    ChipLabel(icon: "calendar.badge.plus", text: "add date", color: .secondary)
+                }
             }
             if let effort = item.effortMinutes {
-                chip(icon: "hourglass", text: formattedEffort(effort), color: .indigo)
+                chipMenu {
+                    effortMenuItems
+                } label: {
+                    ChipLabel(icon: "hourglass", text: QueueFormat.effort(effort), color: .indigo)
+                }
+            } else if isHovering || isSelected {
+                chipMenu {
+                    effortMenuItems
+                } label: {
+                    ChipLabel(icon: "hourglass.badge.plus", text: "effort", color: .secondary)
+                }
+            }
+            if let importance = item.importance {
+                chipMenu {
+                    importanceMenuItems
+                } label: {
+                    ChipLabel(
+                        icon: "flag",
+                        text: QueueFormat.importanceLabel(importance),
+                        color: QueueFormat.importanceColor(importance)
+                    )
+                }
+            } else if isHovering || isSelected {
+                chipMenu {
+                    importanceMenuItems
+                } label: {
+                    ChipLabel(icon: "flag", text: "add priority", color: .secondary)
+                }
             }
             if item.type == .reminder {
-                chip(icon: "bell.badge", text: "reminder", color: .orange)
+                ChipLabel(icon: "bell.badge", text: "reminder", color: .orange)
             }
             if let confidence = item.metadataConfidence, confidence > 0, confidence < 0.55 {
-                chip(icon: "questionmark.diamond", text: "low confidence", color: .secondary)
+                ChipLabel(icon: "questionmark.diamond", text: "low confidence", color: .secondary)
             }
             Spacer(minLength: 0)
         }
     }
 
-    private func chip(icon: String, text: String, color: Color) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 9, weight: .semibold))
-            Text(text)
-                .font(.system(size: 10.5, weight: .semibold, design: .rounded))
-                .lineLimit(1)
+    @ViewBuilder
+    private var snoozeMenuChoices: some View {
+        Button("Wake now", systemImage: "sun.max") {
+            Task { await viewModel.wake(item) }
         }
-        .foregroundStyle(color)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(color.opacity(0.12), in: Capsule())
+        Divider()
+        ForEach(QueueViewModel.SnoozeOption.allCases, id: \.self) { option in
+            Button(option.label) {
+                Task { await viewModel.snooze(item, option) }
+            }
+        }
     }
 
-    private func formatted(_ date: Date) -> String {
-        let calendar = Calendar.current
-        let time = timeString(date)
-        if calendar.isDateInToday(date) { return "today \(time)" }
-        if calendar.isDateInTomorrow(date) { return "tomorrow \(time)" }
-        if calendar.isDateInYesterday(date) { return "overdue" }
-        let formatter = DateFormatter()
-        formatter.locale = Locale.current
-        formatter.dateFormat = calendar.component(.year, from: date) == calendar.component(.year, from: Date())
-            ? "EEE MMM d"
-            : "MMM d, yyyy"
-        return formatter.string(from: date).lowercased()
-    }
-
-    private func timeString(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale.current
-        formatter.dateStyle = .none
-        formatter.timeStyle = .short
-        return formatter.string(from: date).lowercased()
-    }
-
-    private func formattedEffort(_ minutes: Int) -> String {
-        if minutes < 60 { return "\(minutes)m" }
-        if minutes % 60 == 0 { return "\(minutes / 60)h" }
-        return "\(minutes / 60)h \(minutes % 60)m"
-    }
-
-    private func dueColor(_ date: Date) -> Color {
-        let interval = date.timeIntervalSinceNow
-        if interval < 0 { return .red }
-        if interval < 24 * 60 * 60 { return .orange }
-        return .teal
+    private func chipMenu(
+        @ViewBuilder _ content: () -> some View,
+        @ViewBuilder label: () -> some View
+    ) -> some View {
+        Menu(content: content, label: label)
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
     }
 }
 
@@ -619,7 +1189,18 @@ private enum QueueSurface {
         Color(nsColor: .controlBackgroundColor).opacity(0.74)
     }
 
-    static func rowStateFill(isSelected: Bool, isHovering: Bool) -> Color {
+    static func rowStateFill(
+        isSelected: Bool,
+        isHovering: Bool,
+        isCompleting: Bool = false,
+        isSnoozing: Bool = false
+    ) -> Color {
+        if isCompleting {
+            return Color.green.opacity(0.14)
+        }
+        if isSnoozing {
+            return Color.indigo.opacity(0.12)
+        }
         if isSelected {
             return Color(nsColor: .controlAccentColor).opacity(0.12)
         }
@@ -627,6 +1208,22 @@ private enum QueueSurface {
             return DumpUI.SemanticStyle.hoverFill
         }
         return .clear
+    }
+}
+
+/// Bounces its content once each time `trigger` flips true. Wrapped in a
+/// modifier so the symbol effect can be compiled out entirely under reduce
+/// motion.
+private struct CompletionBounce: ViewModifier {
+    let trigger: Bool
+    let enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.symbolEffect(.bounce, value: trigger)
+        } else {
+            content
+        }
     }
 }
 

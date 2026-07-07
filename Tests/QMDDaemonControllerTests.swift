@@ -32,6 +32,8 @@ final class QMDDaemonControllerTests: XCTestCase {
         if case .crashed = await controller.currentState() {} else {
             XCTFail("expected crashed, got \(await controller.currentState())")
         }
+        let port = await controller.currentPort()
+        XCTAssertNil(port)
     }
 
     func testStopReturnsToStopped() async {
