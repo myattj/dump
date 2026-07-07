@@ -1,0 +1,29 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Packages/
+Package.resolved
+
+# Generated runtime artifacts (Phase 1+)
+Runtime/node/
+Runtime/qmd/node_modules/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Coverage
+*.profraw
+*.profdata

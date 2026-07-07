@@ -1,0 +1,133 @@
+name: Dump
+
+options:
+  bundleIdPrefix: com.joshmyatt
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+    DEAD_CODE_STRIPPING: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: NO
+    EXCLUDED_ARCHS: x86_64
+
+packages:
+  HotKey:
+    url: https://github.com/soffes/HotKey
+    from: 0.2.0
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.0
+  Wave:
+    url: https://github.com/jtrivedi/Wave
+    exactVersion: 0.3.4
+
+targets:
+  Dump:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+    resources:
+      - path: Resources
+        excludes:
+          - Info.plist
+          - Dump.entitlements
+    preBuildScripts:
+      - name: Fetch bundled Node + qmd runtime
+        script: |
+          set -e
+          if [ -z "${SRCROOT:-}" ]; then SRCROOT="${PROJECT_DIR:-$PWD}"; fi
+          "${SRCROOT}/Scripts/fetch-runtime.sh"
+        inputFiles:
+          - $(SRCROOT)/Scripts/fetch-runtime.sh
+        outputFiles:
+          - $(SRCROOT)/Runtime/node/bin/node
+        basedOnDependencyAnalysis: true
+      - name: Copy Runtime into app bundle
+        script: |
+          set -e
+          if [ -z "${SRCROOT:-}" ]; then SRCROOT="${PROJECT_DIR:-$PWD}"; fi
+          DEST="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/runtime"
+          mkdir -p "$DEST"
+          rsync -a --delete \
+                --exclude "node_modules/.cache" \
+                --exclude ".npm" \
+                "${SRCROOT}/Runtime/" "$DEST/"
+        inputFiles:
+          - $(SRCROOT)/Runtime/node/bin/node
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/runtime/node/bin/node
+        basedOnDependencyAnalysis: true
+    dependencies:
+      - package: HotKey
+      - package: Sparkle
+      - package: Wave
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleName: Dump
+        CFBundleDisplayName: Dump
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSUIElement: true
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        CADisableMinimumFrameDuration: true
+        NSHumanReadableCopyright: ""
+        SUFeedURL: https://updates.dump.example/appcast.xml
+        SUEnableInstallerLauncherService: true
+        SUPublicEDKey: REPLACE_WITH_SPARKLE_ED25519_PUBLIC_KEY
+    entitlements:
+      path: Resources/Dump.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.cs.allow-jit: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.joshmyatt.dump
+        PRODUCT_NAME: Dump
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Resources/Dump.entitlements
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+
+  DumpTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: Dump
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.joshmyatt.dump.tests
+        BUNDLE_LOADER: $(TEST_HOST)
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Dump.app/Contents/MacOS/Dump
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  Dump:
+    build:
+      targets:
+        Dump: all
+        DumpTests: [test]
+    test:
+      targets:
+        - DumpTests
+      gatherCoverageData: true
+    run:
+      config: Debug
+    archive:
+      config: Release

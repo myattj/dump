@@ -1,0 +1,7 @@
+{
+  "name": "dump-runtime-qmd",
+  "private": true,
+  "dependencies": {
+    "@tobilu/qmd": "2.1.0"
+  }
+}
