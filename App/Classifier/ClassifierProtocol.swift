@@ -51,7 +51,7 @@ public extension Classifier {
 }
 
 public enum ClassifierMode: String, CaseIterable, Sendable {
-    case cloud, local, custom, bedrock
+    case cloud, subscription, local, custom, bedrock
 }
 
 /// Shared UserDefaults key for the classifier/synthesizer mode toggle.
@@ -72,6 +72,7 @@ public enum ClassifierModePreference {
 public actor ClassifierHub {
     public private(set) var mode: ClassifierMode
     private let claude: Classifier
+    private let planBacked: Classifier
     private let ollama: Classifier
     private let custom: Classifier
     private let bedrock: Classifier
@@ -83,6 +84,7 @@ public actor ClassifierHub {
         urlSession: URLSession = .shared,
         defaults: UserDefaults = .standard,
         claude: Classifier? = nil,
+        planBacked: Classifier? = nil,
         ollama: Classifier? = nil,
         custom: Classifier? = nil,
         bedrock: Classifier? = nil
@@ -91,6 +93,7 @@ public actor ClassifierHub {
         self.defaults = defaults
         let transport = HTTPTransport(session: urlSession)
         self.claude = claude ?? ClaudeClassifier(keychain: keychain, transport: transport, configStore: configStore)
+        self.planBacked = planBacked ?? PlanBackedClassifier(configStore: configStore)
         self.ollama = ollama ?? OllamaClassifier(transport: transport)
         self.custom = custom ?? CustomLLMClassifier(keychain: keychain, configStore: configStore, transport: transport)
         self.bedrock = bedrock ?? BedrockClassifier(keychain: keychain, configStore: configStore, transport: transport)
@@ -117,6 +120,7 @@ public actor ClassifierHub {
     private func backend(for mode: ClassifierMode) -> Classifier {
         switch mode {
         case .cloud: return claude
+        case .subscription: return planBacked
         case .local: return ollama
         case .custom: return custom
         case .bedrock: return bedrock

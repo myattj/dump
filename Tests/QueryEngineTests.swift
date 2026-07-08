@@ -2,6 +2,34 @@ import XCTest
 @testable import Dump
 
 final class QueryEngineTests: XCTestCase {
+    var tempRoot: URL!
+    var storage: StoragePreference!
+    var defaults: UserDefaults!
+    var suiteName: String!
+
+    override func setUp() {
+        super.setUp()
+        tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dump-query-tests-\(UUID().uuidString)", isDirectory: true)
+        suiteName = "dump.query.tests.\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)!
+        storage = StoragePreference(defaults: defaults, fallback: tempRoot)
+    }
+
+    override func tearDown() {
+        if let tempRoot {
+            try? FileManager.default.removeItem(at: tempRoot)
+        }
+        if let suiteName {
+            UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        }
+        tempRoot = nil
+        storage = nil
+        defaults = nil
+        suiteName = nil
+        super.tearDown()
+    }
+
     func testSearchSendsLexAndVecSubqueriesAndReturnsHits() async throws {
         let client = MockQMDClient()
         client.stubHits([
@@ -68,5 +96,70 @@ final class QueryEngineTests: XCTestCase {
         let engine = QueryEngine(client: client)
         let names = try await engine.collectionNames()
         XCTAssertEqual(names, ["notes", "inbox"])
+    }
+
+    func testTaggedTodoSummaryIncludesAllMatchingTodoStatuses() async throws {
+        let writer = MarkdownWriter(clock: { Date(timeIntervalSince1970: 1_800_000_000) })
+        try FileManager.default.createDirectory(at: storage.subdirectory(.inbox), withIntermediateDirectories: true)
+
+        _ = try writer.write(body: "Ship tag summary", into: storage.subdirectory(.inbox)) { fm in
+            fm.id = "active-task"
+            fm.type = .task
+            fm.title = "Ship tag summary"
+            fm.tags = ["work"]
+            fm.status = .active
+            fm.deadlineAt = Date(timeIntervalSince1970: 1_800_086_400)
+            fm.effortMinutes = 45
+            fm.importance = 3
+        }
+        _ = try writer.write(body: "Follow up after launch", into: storage.subdirectory(.inbox)) { fm in
+            fm.id = "done-task"
+            fm.type = .reminder
+            fm.title = "Follow up after launch"
+            fm.tags = ["work", "client"]
+            fm.status = .done
+            fm.completedAt = Date(timeIntervalSince1970: 1_800_010_000)
+        }
+        _ = try writer.write(body: "Old idea", into: storage.subdirectory(.inbox)) { fm in
+            fm.type = .idea
+            fm.title = "Old idea"
+            fm.tags = ["work"]
+            fm.status = .active
+        }
+
+        let client = MockQMDClient()
+        let engine = QueryEngine(client: client, storage: storage)
+        let summary = try await engine.taggedTodoSummary(
+            matching: "#work",
+            now: Date(timeIntervalSince1970: 1_800_000_000)
+        )
+
+        XCTAssertEqual(summary?.tag, "work")
+        XCTAssertEqual(summary?.hits.map(\.title), ["Ship tag summary", "Follow up after launch"])
+        XCTAssertEqual(summary?.result.label, "Tag summary")
+        XCTAssertTrue(summary?.result.text.contains("#work has 2 tagged todos: 1 active, 1 done, 0 dismissed.") == true)
+        XCTAssertTrue(summary?.result.text.contains("[1] Ship tag summary (status active, due") == true)
+        XCTAssertTrue(summary?.result.text.contains("45m, importance 3") == true)
+        XCTAssertTrue(summary?.result.text.contains("[2] Follow up after launch (status done, completed") == true)
+        XCTAssertEqual(summary?.result.citations.count, 2)
+        XCTAssertTrue(client.queries.isEmpty)
+    }
+
+    func testTaggedTodoSummaryMatchesBareTagAndTagPrefixCaseInsensitively() async throws {
+        let writer = MarkdownWriter(clock: { Date(timeIntervalSince1970: 1_800_000_000) })
+        try FileManager.default.createDirectory(at: storage.subdirectory(.inbox), withIntermediateDirectories: true)
+        _ = try writer.write(body: "Call Ada", into: storage.subdirectory(.inbox)) { fm in
+            fm.id = "ada"
+            fm.type = .task
+            fm.tags = ["Client"]
+        }
+
+        let engine = QueryEngine(client: MockQMDClient(), storage: storage)
+        let bare = try await engine.taggedTodoSummary(matching: "client")
+        let prefixed = try await engine.taggedTodoSummary(matching: "tag:CLIENT")
+        let phrase = try await engine.taggedTodoSummary(matching: "client followup")
+        XCTAssertEqual(bare?.hits.count, 1)
+        XCTAssertEqual(prefixed?.hits.count, 1)
+        XCTAssertNil(phrase)
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Ranks queue entries by urgency, highest score first.
 ///
@@ -249,7 +250,7 @@ struct QueueMetadataExtractor: Sendable {
             return nil
         }
         for pattern in ["(?:^|\\s)!{1,4}(?=\\s|$)", "(?:^|\\s)~\\d+(?:\\.\\d+)?\\s*(?:m|min|mins|minutes|h|hr|hrs|hours)\\b"] {
-            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
+            if let regex = compiledRegex(for: pattern) {
                 let range = NSRange(line.startIndex..<line.endIndex, in: line)
                 line = regex.stringByReplacingMatches(in: line, options: [], range: range, withTemplate: "")
             }
@@ -492,8 +493,21 @@ struct QueueMetadataExtractor: Sendable {
         firstMatch(in: text, pattern: pattern) != nil
     }
 
+    /// Pattern set is small and fixed; caching compiled regexes avoids
+    /// dozens of redundant ICU compiles per keystroke on the main thread.
+    private static let regexCache = OSAllocatedUnfairLock(initialState: [String: NSRegularExpression]())
+
+    private static func compiledRegex(for pattern: String) -> NSRegularExpression? {
+        regexCache.withLock { cache in
+            if let cached = cache[pattern] { return cached }
+            let compiled = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+            if let compiled { cache[pattern] = compiled }
+            return compiled
+        }
+    }
+
     private static func firstMatch(in text: String, pattern: String) -> [String]? {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+        guard let regex = compiledRegex(for: pattern) else {
             return nil
         }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)

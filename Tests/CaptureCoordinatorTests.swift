@@ -9,6 +9,8 @@ final class CaptureCoordinatorTests: XCTestCase {
     var process: MockProcessLauncher!
     var transport: MockHTTPTransport!
     var daemon: QMDDaemonController!
+    var qmdClient: MockQMDClient!
+    var queryEngine: QueryEngine!
     var hub: ClassifierHub!
     var scheduler: SchedulerService!
     var notif: MockNotificationCenter!
@@ -28,6 +30,8 @@ final class CaptureCoordinatorTests: XCTestCase {
             transport: transport
         )
         await daemon.start()
+        qmdClient = MockQMDClient()
+        queryEngine = QueryEngine(client: qmdClient, storage: storage)
         notif = MockNotificationCenter()
         hub = ClassifierHub(
             keychain: KeychainStore(service: "cap.\(UUID())"),
@@ -39,7 +43,10 @@ final class CaptureCoordinatorTests: XCTestCase {
     }
 
     override func tearDown() async throws {
+        await daemon?.stop()
         try? FileManager.default.removeItem(at: tempRoot)
+        qmdClient = nil
+        queryEngine = nil
         try await super.tearDown()
     }
 
@@ -49,7 +56,8 @@ final class CaptureCoordinatorTests: XCTestCase {
             writer: MarkdownWriter(),
             classifier: hub,
             scheduler: scheduler,
-            daemon: daemon
+            daemon: daemon,
+            queryEngine: queryEngine
         )
         await coordinator.handleSubmission(body: "remind me to take vitamins", source: .capture)
         let inbox = storage.subdirectory(.inbox)
@@ -72,7 +80,8 @@ final class CaptureCoordinatorTests: XCTestCase {
             writer: MarkdownWriter(),
             classifier: failingHub,
             scheduler: scheduler,
-            daemon: daemon
+            daemon: daemon,
+            queryEngine: queryEngine
         )
 
         await coordinator.handleSubmission(body: "send invoice tomorrow 15m", source: .capture)
@@ -92,7 +101,8 @@ final class CaptureCoordinatorTests: XCTestCase {
             writer: MarkdownWriter(),
             classifier: hub,
             scheduler: scheduler,
-            daemon: daemon
+            daemon: daemon,
+            queryEngine: queryEngine
         )
         await coordinator.handleSubmission(body: "marketing sync notes...", source: .meeting)
         let meetings = storage.subdirectory(.meetings)

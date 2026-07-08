@@ -117,3 +117,14 @@ public struct OllamaClassifier: Classifier {
         let metadata_confidence: Double?
     }
 }
+
+extension OllamaClassifier.OllamaError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case let .upstream(status, _):
+            "Ollama returned an error (HTTP \(status)). Is the model pulled and running?"
+        case .malformed:
+            "Ollama returned an unreadable response."
+        }
+    }
+}

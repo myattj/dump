@@ -19,6 +19,8 @@ enum DumpUI {
         static let xxxl: CGFloat = 18
         static let panel: CGFloat = 20
         static let window: CGFloat = 24
+        /// Named role for panel content gutters (empty states, list insets).
+        static let gutter: CGFloat = 20
     }
 
     enum Radius {
@@ -37,7 +39,12 @@ enum DumpUI {
         static let body: Font = .system(size: 14.5)
         static let bodyStrong: Font = .system(size: 14.5, weight: .semibold)
         static let input: Font = .system(size: 16)
-        static let captureInput: Font = .system(size: 17)
+        /// Shared with the AppKit-side NSTextView in the capture window, which
+        /// can't consume a SwiftUI `Font` directly.
+        static let captureInputSize: CGFloat = 17
+        static let captureInput: Font = .system(size: captureInputSize)
+        static let emptyStateIcon: Font = .system(size: 38, weight: .light)
+        static let emptyStateTitle: Font = .system(size: 16, weight: .medium)
     }
 
     enum Controls {
@@ -51,8 +58,10 @@ enum DumpUI {
     }
 
     enum PanelSize {
-        static let capture = NSSize(width: 640, height: 180)
-        static let captureMinimum = NSSize(width: 520, height: 160)
+        /// Height budgets the always-reserved parse-preview slot (22 + 8pt) —
+        /// it must not be paid out of the editor's typing room.
+        static let capture = NSSize(width: 640, height: 210)
+        static let captureMinimum = NSSize(width: 520, height: 190)
         static let query = NSSize(width: 720, height: 520)
         static let queryMinimum = NSSize(width: 560, height: 420)
         static let queue = NSSize(width: 560, height: 620)
@@ -62,12 +71,14 @@ enum DumpUI {
     enum SemanticStyle {
         static let panelMaterial: NSVisualEffectView.Material = .hudWindow
         static let panelFallback = Color(nsColor: .windowBackgroundColor)
-        static let hairline = Color.white.opacity(0.08)
+        static let hairline = Color(nsColor: .separatorColor).opacity(0.6)
         static let subtleFill = Color.primary.opacity(0.025)
         static let hoverFill = Color.primary.opacity(0.045)
         static let selectedFill = Color.primary.opacity(0.075)
         static let focusStroke = Color.accentColor.opacity(0.45)
         static let unfocusedStroke = Color.accentColor.opacity(0.14)
+        static let contentFill = Color(nsColor: .textBackgroundColor).opacity(0.92)
+        static let contentStroke = Color(nsColor: .separatorColor).opacity(0.65)
     }
 
     enum Motion {
@@ -260,7 +271,7 @@ extension View {
         } else {
             self
                 .background(.ultraThinMaterial, in: shape)
-                .overlay(shape.strokeBorder(Color.white.opacity(0.06), lineWidth: 0.5))
+                .overlay(shape.strokeBorder(DumpUI.SemanticStyle.hairline, lineWidth: 0.5))
         }
     }
 }
@@ -313,9 +324,7 @@ struct DumpPanelShell<Content: View>: View {
     var alignment: Alignment = .center
     @ViewBuilder var content: () -> Content
 
-    private var reduceTransparency: Bool {
-        NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-    }
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         ZStack(alignment: alignment) {
@@ -338,6 +347,59 @@ struct DumpPanelShell<Content: View>: View {
                 .strokeBorder(DumpUI.SemanticStyle.hairline, lineWidth: 0.5)
         )
         .frame(minWidth: style.minimumSize.width, minHeight: style.minimumSize.height)
+    }
+}
+
+/// Shared "quiet surface" treatment for content panels: a subtle fill plus a
+/// hairline stroke, matching the per-window queueQuietSurface/queryQuietSurface
+/// modifiers this replaces so all three panels can't drift apart.
+struct DumpQuietSurface: ViewModifier {
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius)
+
+        content
+            .background(shape.fill(DumpUI.SemanticStyle.contentFill))
+            .overlay(shape.strokeBorder(DumpUI.SemanticStyle.contentStroke, lineWidth: 0.5))
+    }
+}
+
+extension View {
+    func dumpQuietSurface(cornerRadius: CGFloat) -> some View {
+        modifier(DumpQuietSurface(cornerRadius: cornerRadius))
+    }
+}
+
+/// Small monospaced key-cap chip, used for keyboard-shortcut hints.
+struct KeyCap: View {
+    let key: String
+    var size: CGFloat = 11
+
+    var body: some View {
+        Text(key)
+            .font(.system(size: size, weight: .semibold, design: .monospaced))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: DumpUI.Radius.keyCap))
+            .foregroundStyle(.secondary)
+    }
+}
+
+/// Centralizes the ✕ clear-button treatment shared by the query and queue
+/// input fields, so the two fields can't drift apart.
+struct DumpClearButtonStyle: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .font(.system(size: 14))
+            .foregroundStyle(Color.primary.opacity(0.55))
+            .labelStyle(.iconOnly)
+    }
+}
+
+extension View {
+    func dumpClearButtonStyle() -> some View {
+        modifier(DumpClearButtonStyle())
     }
 }
 
@@ -392,7 +454,7 @@ struct DumpPanelTitleStrip<Actions: View>: View {
                         .font(DumpUI.Typography.captionStrong)
                         .foregroundStyle(.tertiary)
                         .monospacedDigit()
-                        .contentTransition(.numericText())
+                        .contentTransition(reduceMotion ? .opacity : .numericText())
                 }
                 Spacer(minLength: 0)
                 actions()
@@ -452,6 +514,16 @@ enum DumpWindowChrome {
         }
         panel.isFloatingPanel = true
         panel.level = .floating
+        // NSPanel defaults hidesOnDeactivate to true — AppKit would orderOut()
+        // the panel on app deactivation, skipping PanelAnimator.hide and
+        // desyncing the controllers' isShowing/hideInFlight. The controllers
+        // route auto-dismiss through close() instead.
+        panel.hidesOnDeactivate = false
+        // Appear over whatever Space or full-screen app the user is in, like
+        // Spotlight — the default ([]) pins the panel to its creation Space
+        // and forces a Space switch on every summon.
+        // QueueWindowController may override this per pin state.
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isMovableByWindowBackground = true
         panel.backgroundColor = .clear
         panel.isOpaque = false
@@ -466,6 +538,53 @@ final class PanelFocusRequest: ObservableObject {
 
     func request() {
         token += 1
+    }
+}
+
+/// AppKit-level input focus for the query/queue panels' text fields.
+///
+/// Focus on open is deliberately NOT driven through SwiftUI's `@FocusState`:
+/// a programmatic write is dropped while the hosting window isn't key, and —
+/// observed live on macOS 26 — can be silently swallowed even with the panel
+/// key and the app active (the write never reaches the field's backing view).
+/// `NSWindow.makeFirstResponder` on that backing view is deterministic, works
+/// even before key status lands (the responder is simply already in place
+/// when it does — the capture panel's NSTextView relies on the same
+/// property), and SwiftUI syncs `FocusState` FROM the responder change, so
+/// focus-dependent styling still engages.
+@MainActor
+enum PanelInputFocus {
+    /// Make the panel's first editable text view the first responder.
+    /// Retries across a few runloop turns: on a freshly created panel the
+    /// SwiftUI hierarchy may not have materialized its AppKit backing views
+    /// by the time the controller presents.
+    static func focus(in panel: NSPanel, attempts: Int = 8) {
+        guard let target = findEditableTextInput(panel.contentView) else {
+            guard attempts > 1 else { return }
+            DispatchQueue.main.async { [weak panel] in
+                guard let panel else { return }
+                focus(in: panel, attempts: attempts - 1)
+            }
+            return
+        }
+        // Already editing this field (re-summon of an open panel): leave the
+        // session alone. makeFirstResponder would end it and re-begin via
+        // selectText, select-alling the draft so the next keystroke replaces
+        // it. An NSTextField edit puts its field editor (whose delegate is
+        // the field) first, so check both shapes.
+        if panel.firstResponder === target { return }
+        if let editor = panel.firstResponder as? NSText, editor.delegate === target { return }
+        panel.makeFirstResponder(target)
+    }
+
+    private static func findEditableTextInput(_ view: NSView?) -> NSView? {
+        guard let view else { return nil }
+        if let field = view as? NSTextField, field.isEditable { return field }
+        if let text = view as? NSTextView, text.isEditable { return text }
+        for sub in view.subviews {
+            if let found = findEditableTextInput(sub) { return found }
+        }
+        return nil
     }
 }
 
@@ -505,7 +624,10 @@ enum PanelAnimator {
     }
 
     /// Show with a spring scale-up, small Y drop, and ease-out fade.
-    static func show(_ panel: NSPanel) {
+    /// `chromeMotion: false` skips the scale/drop spring entirely — a bare
+    /// near-zero fade for surfaces under the frequency rule (the capture
+    /// panel opens dozens of times a day; Raycast-class HUDs don't animate).
+    static func show(_ panel: NSPanel, chromeMotion: Bool = true) {
         guard let layer = panel.contentView?.layer else {
             panel.makeKeyAndOrderFront(nil)
             return
@@ -520,9 +642,16 @@ enum PanelAnimator {
         }
         panel.makeKeyAndOrderFront(nil)
 
-        if reduced {
+        if reduced || !chromeMotion {
+            // A show interrupting a hide must clear the in-flight exit
+            // transform, or the panel sticks at cancelScale/cancelDrop —
+            // hide() still animates the exit for this panel.
+            if let transform = waveTransforms[id] {
+                transform.stopAndReset()
+                waveTransforms[id] = nil
+            }
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.12
+                ctx.duration = reduced ? 0.12 : 0.08
                 ctx.timingFunction = DumpUI.Motion.Window.easeOutExpo
                 panel.animator().alphaValue = 1
             }
@@ -593,8 +722,16 @@ enum PanelAnimator {
                 // macOS won't auto-promote a remaining .nonactivatingPanel to
                 // key when the current key panel orders out — leaving the user
                 // with no key window, so Esc/Cmd-W don't reach the visible panel
-                // until they click it.
-                if let next = NSApp.windows.first(where: { $0 !== panel && $0.isVisible && $0.canBecomeKey }) {
+                // until they click it. Only when Dump is the active app: a
+                // nonactivating capture dismissed over another app must hand
+                // keyboard focus back to that app, never grab it for a pinned
+                // panel — and the status-item window must never be promoted,
+                // hence the type filter.
+                if NSApp.isActive,
+                   let next = NSApp.windows.first(where: {
+                       $0 !== panel && $0.isVisible && $0.canBecomeKey
+                           && ($0 is KeyablePanel || $0.styleMask.contains(.titled))
+                   }) {
                     next.makeKey()
                 }
                 completion?()
@@ -610,11 +747,69 @@ enum PanelAnimator {
     }
 }
 
+// MARK: - Flow layout for citation chips
+
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        let rows = computeRows(subviews: subviews, maxWidth: width)
+        let height = rows.reduce(0) { $0 + $1.height } + CGFloat(max(0, rows.count - 1)) * spacing
+        return CGSize(width: width.isFinite ? width : rows.map { $0.width }.max() ?? 0, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let rows = computeRows(subviews: subviews, maxWidth: bounds.width)
+        var y = bounds.minY
+        for row in rows {
+            var x = bounds.minX
+            for entry in row.entries {
+                let size = entry.size
+                subviews[entry.index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+                x += size.width + spacing
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private func computeRows(subviews: Subviews, maxWidth: CGFloat) -> [Row] {
+        var rows: [Row] = []
+        var current = Row()
+        for (i, sub) in subviews.enumerated() {
+            let size = sub.sizeThatFits(.unspecified)
+            let prospectiveWidth = current.width + (current.entries.isEmpty ? 0 : spacing) + size.width
+            if prospectiveWidth > maxWidth, !current.entries.isEmpty {
+                rows.append(current)
+                current = Row()
+            }
+            if !current.entries.isEmpty { current.width += spacing }
+            current.entries.append(.init(index: i, size: size))
+            current.width += size.width
+            current.height = max(current.height, size.height)
+        }
+        if !current.entries.isEmpty { rows.append(current) }
+        return rows
+    }
+
+    struct Row {
+        struct Entry { let index: Int; let size: CGSize }
+        var entries: [Entry] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+}
+
 @MainActor
 private final class PanelWaveTransform: @unchecked Sendable {
     private weak var layer: CALayer?
     private var scale: CGFloat = 1
     private var drop: CGFloat = 0
+    /// Set by stopAndReset(): tick Tasks enqueued before the reset check it
+    /// on arrival and drop themselves, so a stale exit-spring value can't be
+    /// re-applied to a layer that was just reset to identity. One-way — the
+    /// transform is always discarded after stopAndReset().
+    private var stopped = false
     private let scaleAnimator: SpringAnimator<CGFloat>
     private let dropAnimator: SpringAnimator<CGFloat>
 
@@ -623,16 +818,22 @@ private final class PanelWaveTransform: @unchecked Sendable {
         self.scaleAnimator = SpringAnimator<CGFloat>(spring: DumpUI.Motion.Window.showSpring)
         self.dropAnimator = SpringAnimator<CGFloat>(spring: DumpUI.Motion.Window.showDropSpring)
 
+        // Wave ticks arrive on CVDisplayLink's own thread on macOS — NOT the
+        // main thread — so this must hop, never assumeIsolated. Main-actor
+        // jobs run FIFO, so ticks stay ordered; the `stopped` gate is what
+        // keeps a hop enqueued before stopAndReset() from landing after it.
         scaleAnimator.valueChanged = { [weak self] value in
             Task { @MainActor [weak self] in
-                self?.scale = value
-                self?.apply()
+                guard let self, !self.stopped else { return }
+                self.scale = value
+                self.apply()
             }
         }
         dropAnimator.valueChanged = { [weak self] value in
             Task { @MainActor [weak self] in
-                self?.drop = value
-                self?.apply()
+                guard let self, !self.stopped else { return }
+                self.drop = value
+                self.apply()
             }
         }
     }
@@ -679,6 +880,7 @@ private final class PanelWaveTransform: @unchecked Sendable {
     }
 
     func stopAndReset() {
+        stopped = true
         scaleAnimator.stop()
         dropAnimator.stop()
         scale = 1

@@ -107,7 +107,14 @@ public final class QueueViewModel: ObservableObject {
     }
 
     @Published public var input = ""
-    @Published public var items: [QueueItem] = []
+    // Filtered once per items mutation instead of on every body read —
+    // QueueView's body re-runs on every composer keystroke.
+    @Published public var items: [QueueItem] = [] {
+        didSet {
+            nowItems = items.filter { !$0.isLater }
+            laterItems = items.filter(\.isLater)
+        }
+    }
     @Published public private(set) var summary: QueueSummary = .empty
     @Published public var selectedID: String?
     @Published public var isLoading = false
@@ -125,8 +132,8 @@ public final class QueueViewModel: ObservableObject {
     /// toward the Later section it's headed for.
     @Published public private(set) var snoozingID: String?
 
-    public var nowItems: [QueueItem] { items.filter { !$0.isLater } }
-    public var laterItems: [QueueItem] { items.filter(\.isLater) }
+    @Published public private(set) var nowItems: [QueueItem] = []
+    @Published public private(set) var laterItems: [QueueItem] = []
 
     private let storage: StoragePreference
     private let writer: MarkdownWriter
@@ -164,7 +171,7 @@ public final class QueueViewModel: ObservableObject {
             reconcileSelection()
             error = nil
         } catch {
-            self.error = String(describing: error)
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
@@ -203,7 +210,7 @@ public final class QueueViewModel: ObservableObject {
         defer { isSubmitting = false }
 
         do {
-            let result = try writer.write(body: body, into: storage.subdirectory(.inbox), source: .capture) { fm in
+            let result = try await store.add(body: body) { fm in
                 fm.type = preview.dateKind == .reminder ? .reminder : .task
                 fm.title = QueueMetadataExtractor.displayTitle(from: body) ?? "New task"
                 fm.scheduledAt = preview.dateKind == .reminder ? preview.date : nil
@@ -220,7 +227,7 @@ public final class QueueViewModel: ObservableObject {
                 await self?.classifyAndRefresh(url: result.url, body: body, now: now)
             }
         } catch {
-            self.error = String(describing: error)
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
@@ -281,7 +288,7 @@ public final class QueueViewModel: ObservableObject {
             presentUndoToast(UndoToast(title: item.title, kind: .completed, record: undo))
             await refresh()
         } catch {
-            self.error = String(describing: error)
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
@@ -297,7 +304,7 @@ public final class QueueViewModel: ObservableObject {
             presentUndoToast(UndoToast(title: item.title, kind: .snoozed(until: until), record: undo))
             await refresh(now: now)
         } catch {
-            self.error = String(describing: error)
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
@@ -318,7 +325,7 @@ public final class QueueViewModel: ObservableObject {
             try await store.wake(item)
             await refresh()
         } catch {
-            self.error = String(describing: error)
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
@@ -362,7 +369,7 @@ public final class QueueViewModel: ObservableObject {
             _ = await scheduler.reconcile()
             await refresh()
         } catch {
-            self.error = String(describing: error)
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
@@ -373,7 +380,7 @@ public final class QueueViewModel: ObservableObject {
             clearUndoToast()
             await refresh()
         } catch {
-            self.error = String(describing: error)
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
@@ -431,35 +438,36 @@ public final class QueueViewModel: ObservableObject {
     private func classifyAndRefresh(url: URL, body: String, now: Date) async {
         let result = await classifier.classify(body, now: now)
         let metadata = QueueMetadataExtractor.extract(from: body, now: now)
+        let activeIdentifier = await classifier.activeIdentifier
         do {
-            let raw = try String(contentsOf: url, encoding: .utf8)
-            var (fm, _) = try FrontmatterCodec.decode(raw)
-            let userEdited = fm.metadataEdited == true
-            if !userEdited {
-                if result.type == .task || result.type == .reminder {
-                    fm.type = result.type
-                } else if fm.type == .unknown, let inferred = metadata.inferredType {
-                    fm.type = inferred
+            try await store.applyClassification(at: url) { fm in
+                let userEdited = fm.metadataEdited == true
+                if !userEdited {
+                    if result.type == .task || result.type == .reminder {
+                        fm.type = result.type
+                    } else if fm.type == .unknown, let inferred = metadata.inferredType {
+                        fm.type = inferred
+                    }
                 }
+                fm.title = result.title ?? fm.title
+                fm.tags = result.tags.isEmpty ? fm.tags : result.tags
+                // The user set or cleared queue metadata deliberately — a nil
+                // can mean "cleared", so the classifier must not touch these
+                // at all.
+                if !userEdited {
+                    fm.scheduledAt = result.scheduledAt ?? fm.scheduledAt ?? metadata.scheduledAt
+                    fm.deadlineAt = result.deadlineAt ?? fm.deadlineAt ?? metadata.deadlineAt
+                    fm.effortMinutes = result.effortMinutes ?? fm.effortMinutes ?? metadata.effortMinutes
+                    // Explicit syntax ("!!", "urgent") outranks the model's guess.
+                    fm.importance = metadata.importance ?? result.importance ?? fm.importance
+                }
+                fm.metadataConfidence = result.metadataConfidence ?? fm.metadataConfidence
+                fm.classifier = activeIdentifier
             }
-            fm.title = result.title ?? fm.title
-            fm.tags = result.tags.isEmpty ? fm.tags : result.tags
-            // The user set or cleared queue metadata deliberately — a nil can
-            // mean "cleared", so the classifier must not touch these at all.
-            if !userEdited {
-                fm.scheduledAt = result.scheduledAt ?? fm.scheduledAt ?? metadata.scheduledAt
-                fm.deadlineAt = result.deadlineAt ?? fm.deadlineAt ?? metadata.deadlineAt
-                fm.effortMinutes = result.effortMinutes ?? fm.effortMinutes ?? metadata.effortMinutes
-                // Explicit syntax ("!!", "urgent") outranks the model's guess.
-                fm.importance = metadata.importance ?? result.importance ?? fm.importance
-            }
-            fm.metadataConfidence = result.metadataConfidence ?? fm.metadataConfidence
-            fm.classifier = await classifier.activeIdentifier
-            try writer.rewriteFrontmatter(at: url, with: fm)
             _ = await scheduler.reconcile()
             await refresh()
         } catch {
-            self.error = String(describing: error)
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 

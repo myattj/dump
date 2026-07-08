@@ -127,3 +127,20 @@ public struct CustomLLMClassifier: Classifier {
         let metadata_confidence: Double?
     }
 }
+
+extension CustomLLMClassifier.CustomLLMError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .missingAPIKey:
+            "No API key for the custom endpoint — add one in Settings → Classifier."
+        case .missingBaseURL:
+            "No base URL for the custom endpoint — set one in Settings → Classifier."
+        case .missingModel:
+            "No model name for the custom endpoint — set one in Settings → Classifier."
+        case let .upstream(status, _):
+            "The custom endpoint returned an error (HTTP \(status))."
+        case .malformed:
+            "The custom endpoint returned an unreadable response."
+        }
+    }
+}

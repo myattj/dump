@@ -3,26 +3,36 @@ import SwiftUI
 /// Shared formatting for queue metadata shown in row chips, the composer's
 /// live parse strip, and the capture panel preview.
 enum QueueFormat {
+    // Formatter creation is expensive ICU work; these are immutable after init
+    // and formatting is thread-safe on modern macOS, so cache them once.
+    private static let sameYearFormatter: DateFormatter = {
+        let f = DateFormatter(); f.locale = .current; f.dateFormat = "EEE MMM d"; return f
+    }()
+    private static let otherYearFormatter: DateFormatter = {
+        let f = DateFormatter(); f.locale = .current; f.dateFormat = "MMM d, yyyy"; return f
+    }()
+    private static let shortTimeFormatter: DateFormatter = {
+        let f = DateFormatter(); f.locale = .current; f.dateStyle = .none; f.timeStyle = .short; return f
+    }()
+    // RelativeDateTimeFormatter (unlike DateFormatter) is not marked Sendable
+    // on this SDK; it's immutable after init and only formats, so the
+    // annotation is safe.
+    nonisolated(unsafe) private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter(); f.unitsStyle = .short; return f
+    }()
+
     static func date(_ date: Date, now: Date = Date()) -> String {
         let calendar = Calendar.current
         let time = timeString(date)
         if calendar.isDateInToday(date) { return "today \(time)" }
         if calendar.isDateInTomorrow(date) { return "tomorrow \(time)" }
         if date < now { return "overdue" }
-        let formatter = DateFormatter()
-        formatter.locale = Locale.current
-        formatter.dateFormat = calendar.component(.year, from: date) == calendar.component(.year, from: now)
-            ? "EEE MMM d"
-            : "MMM d, yyyy"
-        return formatter.string(from: date).lowercased()
+        let sameYear = calendar.component(.year, from: date) == calendar.component(.year, from: now)
+        return (sameYear ? Self.sameYearFormatter : Self.otherYearFormatter).string(from: date).lowercased()
     }
 
     static func timeString(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale.current
-        formatter.dateStyle = .none
-        formatter.timeStyle = .short
-        return formatter.string(from: date).lowercased()
+        Self.shortTimeFormatter.string(from: date).lowercased()
     }
 
     static func effort(_ minutes: Int) -> String {
@@ -82,9 +92,7 @@ enum QueueFormat {
     }
 
     private static func relative(_ date: Date, now: Date) -> String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .short
-        return formatter.localizedString(for: date, relativeTo: now)
+        Self.relativeFormatter.localizedString(for: date, relativeTo: now)
     }
 }
 
@@ -110,6 +118,7 @@ struct ChipLabel: View {
         HStack(spacing: 4) {
             Image(systemName: icon)
                 .font(.system(size: 9, weight: .semibold))
+                .accessibilityHidden(true)
             Text(text)
                 .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                 .lineLimit(1)
@@ -118,6 +127,7 @@ struct ChipLabel: View {
         .padding(.horizontal, 6)
         .padding(.vertical, 2)
         .background(color.opacity(0.12), in: Capsule())
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -169,6 +179,7 @@ struct ParsePreviewStrip: View {
         if let action {
             Button(action: action, label: label)
                 .buttonStyle(PressableButtonStyle(pressedScale: 0.92))
+                .modifier(ChipHoverHighlight())
         } else {
             label()
         }
@@ -179,15 +190,33 @@ struct ParsePreviewStrip: View {
         HStack(spacing: 2) {
             content()
             if let onClear {
-                Button("Discard", systemImage: "xmark.circle.fill") {
+                Button {
                     onClear(field)
+                } label: {
+                    Label("Discard", systemImage: "xmark.circle.fill")
+                        .font(.system(size: 10))
+                        .labelStyle(.iconOnly)
+                        .frame(width: DumpUI.Controls.smallIconButton.width,
+                               height: DumpUI.Controls.smallIconButton.height)
+                        .contentShape(Rectangle())
                 }
-                .font(.system(size: 10))
                 .foregroundStyle(Color.primary.opacity(0.4))
-                .labelStyle(.iconOnly)
                 .buttonStyle(PressableButtonStyle(pressedScale: 0.86))
                 .help("Discard")
             }
         }
+    }
+}
+
+private struct ChipHoverHighlight: ViewModifier {
+    @State private var hovering = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        content
+            .brightness(hovering ? 0.08 : 0)
+            .scaleEffect(reduceMotion ? 1 : (hovering ? 1.03 : 1))
+            .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: hovering)
+            .onHover { hovering = $0 }
     }
 }

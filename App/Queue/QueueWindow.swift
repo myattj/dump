@@ -13,7 +13,6 @@ public final class QueueWindowController: NSObject, NSWindowDelegate {
     private var isShowing = false
     private var hideInFlight = false
     private var deactivateObserver: NSObjectProtocol?
-    private let focusRequest = PanelFocusRequest()
     private let viewModel: QueueViewModel
     private let defaults: UserDefaults
     private var isPinned: Bool {
@@ -83,7 +82,6 @@ public final class QueueWindowController: NSObject, NSWindowDelegate {
         if panel == nil {
             let view = QueueView(
                 viewModel: viewModel,
-                focusRequest: focusRequest,
                 onCancel: { [weak self] in self?.close() },
                 onTogglePinned: { [weak self] in self?.togglePinned() }
             )
@@ -105,11 +103,11 @@ public final class QueueWindowController: NSObject, NSWindowDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         PanelAnimator.show(panel)
-        focusRequest.request()
+        PanelInputFocus.focus(in: panel)
     }
 
     private func position(_ panel: NSPanel) {
-        if isPinned, let frame = savedFrame(), isFrameVisible(frame) {
+        if let frame = savedFrame(), isFrameVisible(frame) {
             panel.setFrame(frame, display: false)
             return
         }
@@ -124,7 +122,7 @@ public final class QueueWindowController: NSObject, NSWindowDelegate {
             saveFrame()
             return
         }
-        panel.center()
+        panel.center() // no saved frame yet — first-ever show
     }
 
     private func updatePanelBehavior() {
@@ -136,7 +134,7 @@ public final class QueueWindowController: NSObject, NSWindowDelegate {
     }
 
     private func saveFrame() {
-        guard isPinned, let panel else { return }
+        guard let panel else { return }
         defaults.set(NSStringFromRect(panel.frame), forKey: DefaultsKey.frame)
     }
 
@@ -161,12 +159,15 @@ public final class QueueWindowController: NSObject, NSWindowDelegate {
 
 struct QueueView: View {
     @ObservedObject var viewModel: QueueViewModel
-    @ObservedObject var focusRequest: PanelFocusRequest
     let onCancel: @MainActor () -> Void
     let onTogglePinned: @MainActor () -> Void
 
+    // Styling + in-view refocus only (clear/submit). Focus on open is owned
+    // by the controller via PanelInputFocus — a programmatic FocusState
+    // write on a fresh panel is silently dropped (see PanelInputFocus).
     @FocusState private var inputFocused: Bool
     @State private var laterExpanded = false
+    @State private var laterHovering = false
     @State private var emptyStateBounce = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -197,15 +198,12 @@ struct QueueView: View {
                     ))
             }
         }
-        .onAppear { requestInputFocus() }
-        .onChange(of: focusRequest.token) { _, _ in
-            requestInputFocus()
-        }
         .onKeyPress(.escape) {
             onCancel()
             return .handled
         }
         .onKeyPress(.downArrow) {
+            guard !viewModel.items.isEmpty else { return .ignored }
             // Key-repeat path: selection moves on the 100ms micro curve only.
             withAnimation(resolved(Motion.micro, reduceMotion: reduceMotion)) {
                 viewModel.selectNext()
@@ -213,12 +211,17 @@ struct QueueView: View {
             return .handled
         }
         .onKeyPress(.upArrow) {
+            guard !viewModel.items.isEmpty else { return .ignored }
             withAnimation(resolved(Motion.micro, reduceMotion: reduceMotion)) {
                 viewModel.selectPrevious()
             }
             return .handled
         }
-        .task { await viewModel.refresh() }
+        // QueueWindowController.show() already dispatches `Task { await
+        // viewModel.refresh() }` on every present, and close() nils the
+        // panel, so a `.task` here would re-fire on every open — a second
+        // full inbox scan/parse queued behind the first on the QueueStore
+        // actor.
         .onChange(of: viewModel.items.isEmpty) { wasEmpty, isEmpty in
             // One earned bounce when the user clears the last item — never
             // on first load, never looping. Lives on the body (always
@@ -239,33 +242,21 @@ struct QueueView: View {
         .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.isPinned)
     }
 
-    private func requestInputFocus() {
-        inputFocused = false
-        Task { @MainActor in
-            inputFocused = true
-        }
-    }
-
     private var titleStrip: some View {
         DumpPanelTitleStrip(
             iconName: "checklist",
             title: "Queue",
-            badge: viewModel.items.isEmpty ? nil : "\(viewModel.items.count)"
+            badge: viewModel.items.isEmpty ? nil : "\(viewModel.items.count)",
+            horizontalPadding: DumpUI.Spacing.gutter
         ) {
-            Button(viewModel.isPinned ? "Unpin queue" : "Keep queue open", systemImage: viewModel.isPinned ? "pin.fill" : "pin", action: onTogglePinned)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(viewModel.isPinned ? Color.accentColor : Color.secondary)
-                .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
-                .frame(width: DumpUI.Controls.iconButton.width, height: DumpUI.Controls.iconButton.height)
-                .labelStyle(.iconOnly)
-                .buttonStyle(PressableButtonStyle(pressedScale: 0.88))
-                .help(viewModel.isPinned ? "Unpin" : "Keep open")
-            Button("Close queue", systemImage: "xmark", action: onCancel)
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(.secondary)
-                .frame(width: DumpUI.Controls.iconButton.width, height: DumpUI.Controls.iconButton.height)
-                .labelStyle(.iconOnly)
-                .buttonStyle(PressableButtonStyle(pressedScale: 0.88))
+            TitleStripIconButton(
+                title: viewModel.isPinned ? "Unpin queue" : "Keep queue open",
+                systemImage: viewModel.isPinned ? "pin.fill" : "pin",
+                tint: viewModel.isPinned ? .accentColor : .secondary,
+                action: onTogglePinned
+            )
+            .help(viewModel.isPinned ? "Unpin" : "Keep open")
+            TitleStripIconButton(title: "Close queue", systemImage: "xmark", font: .system(size: 11, weight: .bold), action: onCancel)
                 .help("Close")
             }
             // Count-keyed (not items-keyed) so the badge's numericText rolls
@@ -274,9 +265,10 @@ struct QueueView: View {
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let preview = viewModel.preview()   // one extractor pass per render
+        return VStack(alignment: .leading, spacing: 8) {
             composerField
-            if let preview = viewModel.preview(), !preview.isEmpty {
+            if let preview, !preview.isEmpty {
                 ParsePreviewStrip(
                     preview: preview,
                     onToggleDateKind: { viewModel.toggleDateKind() },
@@ -292,12 +284,12 @@ struct QueueView: View {
                 ))
             }
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, DumpUI.Spacing.gutter)
         .padding(.bottom, 14)
         // Keyed on the minute-stable projection, not the raw preview — its
         // Date carries sub-second precision from "in 30 minutes"-style
         // parses, which would re-key this animation on every keystroke.
-        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.preview()?.animationKey)
+        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: preview?.animationKey)
     }
 
     private var composerField: some View {
@@ -316,7 +308,7 @@ struct QueueView: View {
                         .foregroundColor(Color.primary.opacity(0.42))
                 )
                 .textFieldStyle(.plain)
-                .font(.system(size: 16))
+                .font(DumpUI.Typography.input)
                 .foregroundStyle(.primary)
                 .focused($inputFocused)
                 .onSubmit {
@@ -327,30 +319,36 @@ struct QueueView: View {
                 }
 
                 if !viewModel.input.isEmpty {
-                    Button("Clear queue item", systemImage: "xmark.circle.fill") {
+                    Button {
                         viewModel.clearComposer()
                         inputFocused = true
+                    } label: {
+                        Label("Clear queue item", systemImage: "xmark.circle.fill")
+                            .dumpClearButtonStyle()
+                            .frame(width: DumpUI.Controls.smallIconButton.width, height: DumpUI.Controls.smallIconButton.height)
+                            .contentShape(Rectangle())
                     }
-                    .font(.system(size: 13))
-                    .foregroundStyle(Color.primary.opacity(0.52))
-                    .labelStyle(.iconOnly)
                     .buttonStyle(PressableButtonStyle(pressedScale: 0.86))
                     .transition(clearButtonTransition(reduceMotion: reduceMotion))
                 }
 
-                Button("Add to queue", systemImage: "arrow.up.circle.fill") {
+                Button {
                     Task {
                         await viewModel.submit()
                         inputFocused = true
                     }
+                } label: {
+                    Label("Add to queue", systemImage: "arrow.up.circle.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .labelStyle(.iconOnly)
+                        .frame(width: DumpUI.Controls.smallIconButton.width, height: DumpUI.Controls.smallIconButton.height)
+                        .contentShape(Rectangle())
                 }
-                .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(
                     viewModel.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                         ? Color.secondary.opacity(0.45)
                         : Color.accentColor
                 )
-                .labelStyle(.iconOnly)
                 .buttonStyle(PressableButtonStyle(pressedScale: 0.88))
                 .disabled(viewModel.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .help("Add")
@@ -359,8 +357,8 @@ struct QueueView: View {
             .padding(.vertical, 10)
             .liquidGlass(in: RoundedRectangle(cornerRadius: 8), interactive: true)
             .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.accentColor.opacity(inputFocused ? 0.42 : 0.14), lineWidth: 1)
+                RoundedRectangle(cornerRadius: DumpUI.Radius.control)
+                    .stroke(inputFocused ? DumpUI.SemanticStyle.focusStroke : DumpUI.SemanticStyle.unfocusedStroke, lineWidth: 1)
             )
             .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: inputFocused)
             // Keyed on .isEmpty, not the text — fires exactly twice per
@@ -368,8 +366,6 @@ struct QueueView: View {
             // keystroke.
             .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: viewModel.input.isEmpty)
         }
-        .padding(.horizontal, 18)
-        .padding(.bottom, 14)
     }
 
     @ViewBuilder
@@ -386,12 +382,24 @@ struct QueueView: View {
                         reduceMotion: reduceMotion
                     ))
             } else {
-                list
+                VStack(spacing: 8) {
+                    if let error = viewModel.error {
+                        errorState(error)
+                            .transition(reducedTransition(
+                                .opacity.combined(with: .offset(y: -4)),
+                                reduceMotion: reduceMotion
+                            ))
+                    }
+                    list
+                }
             }
         }
         // Fires at most once per submit/complete — drives the list ↔
         // empty-state swap with a hint of overshoot (the reward moment).
         .animation(resolved(Motion.bouncy, reduceMotion: reduceMotion), value: viewModel.items.isEmpty)
+        // Without this the inline error banner inserts with no animation —
+        // the Group's only other key is items.isEmpty.
+        .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.error)
     }
 
     /// Removal direction mirrors what happened: completed rows exit right
@@ -420,10 +428,12 @@ struct QueueView: View {
                         QueueRow(
                             viewModel: viewModel,
                             item: item,
-                            isSelected: viewModel.selectedID == item.id
+                            isSelected: viewModel.selectedID == item.id,
+                            isCompleting: viewModel.completingID == item.id,
+                            isSnoozing: viewModel.snoozingID == item.id
                         )
                         .id(item.id)
-                        .padding(.horizontal, 18)
+                        .padding(.horizontal, DumpUI.Spacing.gutter)
                         .transition(rowTransition(for: item))
                     }
                     if !viewModel.laterItems.isEmpty {
@@ -478,10 +488,16 @@ struct QueueView: View {
             .foregroundStyle(.secondary)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(laterHovering ? DumpUI.SemanticStyle.hoverFill : .clear)
+            )
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .padding(.horizontal, 18)
+        .buttonStyle(PressableButtonStyle(pressedScale: 0.98))
+        .onHover { laterHovering = $0 }
+        .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: laterHovering)
+        .padding(.horizontal, DumpUI.Spacing.gutter)
         .padding(.top, 6)
 
         if laterExpanded {
@@ -489,10 +505,12 @@ struct QueueView: View {
                 QueueRow(
                     viewModel: viewModel,
                     item: item,
-                    isSelected: viewModel.selectedID == item.id
+                    isSelected: viewModel.selectedID == item.id,
+                    isCompleting: viewModel.completingID == item.id,
+                    isSnoozing: viewModel.snoozingID == item.id
                 )
                 .id(item.id)
-                .padding(.horizontal, 18)
+                .padding(.horizontal, DumpUI.Spacing.gutter)
                 .opacity(0.75)
                 .transition(reducedTransition(
                     .opacity.combined(with: .offset(y: -4)),
@@ -519,7 +537,7 @@ struct QueueView: View {
             Spacer()
             emptyTrayIcon
             Text("Your queue is clear")
-                .font(.system(size: 15, weight: .medium))
+                .font(DumpUI.Typography.emptyStateTitle)
                 .foregroundStyle(.secondary)
             Spacer()
         }
@@ -530,7 +548,7 @@ struct QueueView: View {
     @ViewBuilder
     private var emptyTrayIcon: some View {
         let icon = Image(systemName: "tray")
-            .font(.system(size: 34, weight: .light))
+            .font(DumpUI.Typography.emptyStateIcon)
             .foregroundStyle(.tertiary)
             .symbolRenderingMode(.hierarchical)
 
@@ -560,8 +578,8 @@ struct QueueView: View {
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .queueQuietSurface(cornerRadius: 8)
-        .padding(.horizontal, 18)
+        .dumpQuietSurface(cornerRadius: DumpUI.Radius.surface)
+        .padding(.horizontal, DumpUI.Spacing.gutter)
     }
 
     private var keyboardDoneButton: some View {
@@ -577,19 +595,28 @@ struct QueueView: View {
             } label: {
                 EmptyView()
             }
-            .keyboardShortcut(.upArrow, modifiers: [.command])
+            .keyboardShortcut(.upArrow, modifiers: [.command, .option]) // ⌥⌘↑ — leaves ⌘↑/⌘↓ caret jumps to the field editor
             Button {
                 Task { await viewModel.adjustSelectedImportance(by: -1) }
             } label: {
                 EmptyView()
             }
-            .keyboardShortcut(.downArrow, modifiers: [.command])
+            .keyboardShortcut(.downArrow, modifiers: [.command, .option])
             Button {
                 Task { await viewModel.snoozeSelected(.tomorrow) }
             } label: {
                 EmptyView()
             }
             .keyboardShortcut("s", modifiers: [.command])
+            Button {
+                Task { await viewModel.undoCompletion() }
+            } label: {
+                EmptyView()
+            }
+            .keyboardShortcut("z", modifiers: [.command])
+            // Armed only while the undo toast is up — otherwise Cmd+Z must
+            // fall through to the focused composer's text undo.
+            .disabled(viewModel.undoToast == nil)
         }
         .frame(width: 0, height: 0)
         .opacity(0)
@@ -620,11 +647,12 @@ struct QueueView: View {
             Button("Undo completion", systemImage: "arrow.uturn.backward") {
                 Task { await viewModel.undoCompletion() }
             }
+            .keyboardShortcut("z", modifiers: [.command])
             .font(.system(size: 12, weight: .semibold))
             .frame(width: 24, height: 24)
             .labelStyle(.iconOnly)
             .buttonStyle(PressableButtonStyle(pressedScale: 0.88))
-            .help("Undo")
+            .help("Undo (⌘Z)")
             Button("Dismiss undo message", systemImage: "xmark") {
                 viewModel.dismissUndo()
             }
@@ -643,10 +671,37 @@ struct QueueView: View {
         // per animation frame.
         .compositingGroup()
         .shadow(color: .black.opacity(0.18), radius: 16, y: 8)
-        .padding(.horizontal, 18)
+        .padding(.horizontal, DumpUI.Spacing.gutter)
         // Hovering pauses the auto-dismiss countdown so Undo stays
         // reachable; leaving resumes it on a short fuse.
         .onHover { viewModel.holdUndoToast($0) }
+    }
+}
+
+/// Hover wash + real 24pt target for title-strip icon buttons.
+private struct TitleStripIconButton: View {
+    let title: String
+    let systemImage: String
+    var font: Font = .system(size: 12, weight: .semibold)
+    var tint: Color = .secondary
+    let action: @MainActor () -> Void
+    @State private var hovering = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: systemImage)
+                .font(font)
+                .labelStyle(.iconOnly)
+                .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
+                .frame(width: DumpUI.Controls.iconButton.width, height: DumpUI.Controls.iconButton.height)
+                .background(Circle().fill(hovering ? DumpUI.SemanticStyle.hoverFill : Color.clear))
+                .contentShape(Rectangle())
+        }
+        .foregroundStyle(tint)
+        .buttonStyle(PressableButtonStyle(pressedScale: 0.88))
+        .onHover { hovering = $0 }
+        .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: hovering)
     }
 }
 
@@ -702,9 +757,16 @@ private struct QueueRow: View {
         case done, snooze
     }
 
-    @ObservedObject var viewModel: QueueViewModel
+    // Plain reference, not @ObservedObject: the row calls actions on the
+    // view model but must not observe it — a single @Published mutation
+    // (every composer keystroke) would re-render every visible row. The
+    // flags it needs arrive as lets from the parent, restoring SwiftUI's
+    // per-row diffing.
+    let viewModel: QueueViewModel
     let item: QueueItem
     let isSelected: Bool
+    let isCompleting: Bool
+    let isSnoozing: Bool
 
     // StateObject so the engine (and its Wave animator) is built once per
     // row identity, not on every body evaluation of the parent view.
@@ -715,15 +777,23 @@ private struct QueueRow: View {
     @State private var isHovering = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private var isCompleting: Bool { viewModel.completingID == item.id }
-    private var isSnoozing: Bool { viewModel.snoozingID == item.id }
-
     var body: some View {
         ZStack(alignment: .leading) {
             doneRail
             snoozeRail
-            rowContent
-                .offset(x: dragX)
+            QueueRowContent(
+                viewModel: viewModel,
+                item: item,
+                isSelected: isSelected,
+                isHovering: isHovering,
+                isCompleting: isCompleting,
+                isSnoozing: isSnoozing
+            )
+            // Equatable gate: Wave writes dragX at display-link rate during
+            // a swipe — only the rails and the offset below depend on it, so
+            // the chips/menus/formatters subtree is never re-diffed per frame.
+            .equatable()
+            .offset(x: dragX)
         }
         .background(
             GeometryReader { proxy in
@@ -743,7 +813,6 @@ private struct QueueRow: View {
             engine.onValue = { dragX = $0 }
         }
         .gesture(swipeGesture)
-        .contextMenu { contextMenuItems }
         // Once committed, the leftover rail must not accept another grab or
         // tap while the row waits to be removed.
         .allowsHitTesting(!(isCompleting || isSnoozing))
@@ -863,6 +932,149 @@ private struct QueueRow: View {
         }
     }
 
+    // The rails map directly to drag progress — no Animation, just the
+    // finger. Opacity ramps in over the first ~40pt, the glyph grows toward
+    // the threshold and pops (Motion.press, from updateThresholdSide) when
+    // the commit locks in.
+
+    private var doneRail: some View {
+        let progress = max(dragX, 0)
+        return RoundedRectangle(cornerRadius: 8)
+            .fill(Color.green.opacity(thresholdSide == .done ? 0.30 : 0.18))
+            .overlay(alignment: .leading) {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.green)
+                    .scaleEffect(railGlyphScale(progress: progress, popped: thresholdSide == .done))
+                    .offset(x: min(progress * 0.12, 8))
+                    .padding(.leading, 18)
+            }
+            .opacity(railOpacity(progress: progress))
+    }
+
+    private var snoozeRail: some View {
+        let progress = max(-dragX, 0)
+        return RoundedRectangle(cornerRadius: 8)
+            .fill(Color.indigo.opacity(thresholdSide == .snooze ? 0.30 : 0.18))
+            .overlay(alignment: .trailing) {
+                Image(systemName: "moon.zzz.fill")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.indigo)
+                    .scaleEffect(railGlyphScale(progress: progress, popped: thresholdSide == .snooze))
+                    .offset(x: -min(progress * 0.12, 8))
+                    .padding(.trailing, 18)
+            }
+            .opacity(railOpacity(progress: progress))
+    }
+
+    private func railOpacity(progress: CGFloat) -> CGFloat {
+        min(max((progress - 8) / 32, 0), 1)
+    }
+
+    private func railGlyphScale(progress: CGFloat, popped: Bool) -> CGFloat {
+        let grown = 0.7 + 0.3 * min(progress / DumpUI.Motion.Swipe.commitThreshold, 1)
+        return popped ? grown * 1.15 : grown
+    }
+}
+
+/// The visible row minus the swipe rails. Equatable so the parent's
+/// per-frame dragX writes during a swipe re-diff only the rails and the
+/// offset — never this subtree (chips, menus, formatted dates).
+private struct QueueRowContent: View, Equatable {
+    let viewModel: QueueViewModel
+    let item: QueueItem
+    let isSelected: Bool
+    let isHovering: Bool
+    let isCompleting: Bool
+    let isSnoozing: Bool
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    // nonisolated (Equatable's requirement; View is MainActor-isolated), so
+    // it may only read Sendable lets — viewModel is deliberately excluded:
+    // it's the same instance for the window's lifetime and is actions-only.
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.item == rhs.item
+            && lhs.isSelected == rhs.isSelected
+            && lhs.isHovering == rhs.isHovering
+            && lhs.isCompleting == rhs.isCompleting
+            && lhs.isSnoozing == rhs.isSnoozing
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            completeButton
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(item.title)
+                        .font(DumpUI.Typography.bodyStrong)
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Text("#\(item.queueRank)")
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.tertiary)
+                        .monospacedDigit()
+                        .help(QueueFormat.rankExplanation(for: item))
+                }
+                metadata
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(rowBackground)
+        .overlay(rowStroke)
+        .contextMenu { contextMenuItems }
+    }
+
+    /// The ~150ms acknowledgment beat: the circle fills into a bouncing
+    /// green checkmark (or indigo moon for snooze) the instant the action
+    /// fires, while the store IO runs — then the row departs.
+    @ViewBuilder
+    private var completeButton: some View {
+        let filled = isCompleting || isSelected || isHovering
+        let name = isSnoozing ? "moon.zzz.fill" : (filled ? "checkmark.circle.fill" : "circle")
+        let tint: Color = isCompleting ? .green : (isSnoozing ? .indigo : (isSelected ? .green : Color.secondary.opacity(0.72)))
+
+        Button {
+            Task { await viewModel.complete(item) }
+        } label: {
+            Label("Mark done", systemImage: name)
+                .font(.system(size: 18, weight: .semibold))
+                .labelStyle(.iconOnly)
+                .frame(width: DumpUI.Controls.smallIconButton.width, height: DumpUI.Controls.smallIconButton.height)
+                .contentShape(Rectangle())
+        }
+        .foregroundStyle(tint)
+        .symbolRenderingMode(.hierarchical)
+        .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
+        .modifier(CompletionBounce(trigger: isCompleting, enabled: !reduceMotion))
+        .padding(.top, 1)
+        .buttonStyle(PressableButtonStyle(pressedScale: 0.84))
+        .help("Mark done")
+    }
+
+    private var rowBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 8)
+
+        return shape
+            .fill(QueueSurface.rowFill)
+            .overlay(shape.fill(QueueSurface.rowStateFill(
+                isSelected: isSelected,
+                isHovering: isHovering,
+                isCompleting: isCompleting,
+                isSnoozing: isSnoozing
+            )))
+    }
+
+    private var rowStroke: some View {
+        RoundedRectangle(cornerRadius: 8)
+            .strokeBorder(isSelected ? Color.accentColor.opacity(0.45) : DumpUI.SemanticStyle.contentStroke, lineWidth: 1)
+    }
+
     @ViewBuilder
     private var contextMenuItems: some View {
         Button("Mark done", systemImage: "checkmark.circle") {
@@ -884,6 +1096,16 @@ private struct QueueRow: View {
         Menu("Importance") { importanceMenuItems }
         Menu("Effort") { effortMenuItems }
         Menu(item.type == .reminder ? "Remind" : "Due") { dateMenuItems }
+        Divider()
+        // Same icon and body-or-title fallback as the query window's Copy
+        // quick action — one copy grammar app-wide.
+        Button("Copy text", systemImage: "doc.on.clipboard") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(item.body.isEmpty ? item.title : item.body, forType: .string)
+        }
+        Button("Open note", systemImage: "arrow.up.forward.app") {
+            NSWorkspace.shared.open(item.url)
+        }
     }
 
     @ViewBuilder
@@ -968,122 +1190,8 @@ private struct QueueRow: View {
             : calendar.date(byAdding: .day, value: 1, to: candidate) ?? candidate
     }
 
-    private var rowContent: some View {
-        HStack(alignment: .top, spacing: 12) {
-            completeButton
-
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(item.title)
-                        .font(.system(size: 14.5, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 8)
-                    Text("#\(item.queueRank)")
-                        .font(.system(size: 11, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.tertiary)
-                        .monospacedDigit()
-                        .help(QueueFormat.rankExplanation(for: item))
-                }
-                metadata
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 11)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(rowBackground)
-        .overlay(rowStroke)
-    }
-
-    /// The ~150ms acknowledgment beat: the circle fills into a bouncing
-    /// green checkmark (or indigo moon for snooze) the instant the action
-    /// fires, while the store IO runs — then the row departs.
-    @ViewBuilder
-    private var completeButton: some View {
-        let filled = isCompleting || isSelected || isHovering
-        let name = isSnoozing ? "moon.zzz.fill" : (filled ? "checkmark.circle.fill" : "circle")
-        let tint: Color = isCompleting ? .green : (isSnoozing ? .indigo : (isSelected ? .green : Color.secondary.opacity(0.72)))
-
-        Button("Mark done", systemImage: name) {
-            Task { await viewModel.complete(item) }
-        }
-        .font(.system(size: 18, weight: .semibold))
-        .foregroundStyle(tint)
-        .symbolRenderingMode(.hierarchical)
-        .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
-        .modifier(CompletionBounce(trigger: isCompleting, enabled: !reduceMotion))
-        .frame(width: 22, height: 22)
-        .padding(.top, 1)
-        .labelStyle(.iconOnly)
-        .buttonStyle(PressableButtonStyle(pressedScale: 0.84))
-        .help("Mark done")
-    }
-
-    private var rowBackground: some View {
-        let shape = RoundedRectangle(cornerRadius: 8)
-
-        return shape
-            .fill(QueueSurface.rowFill)
-            .overlay(shape.fill(QueueSurface.rowStateFill(
-                isSelected: isSelected,
-                isHovering: isHovering,
-                isCompleting: isCompleting,
-                isSnoozing: isSnoozing
-            )))
-    }
-
-    private var rowStroke: some View {
-        RoundedRectangle(cornerRadius: 8)
-            .strokeBorder(isSelected ? Color.accentColor.opacity(0.45) : QueueSurface.contentStroke, lineWidth: 1)
-    }
-
-    // The rails map directly to drag progress — no Animation, just the
-    // finger. Opacity ramps in over the first ~40pt, the glyph grows toward
-    // the threshold and pops (Motion.press, from updateThresholdSide) when
-    // the commit locks in.
-
-    private var doneRail: some View {
-        let progress = max(dragX, 0)
-        return RoundedRectangle(cornerRadius: 8)
-            .fill(Color.green.opacity(thresholdSide == .done ? 0.30 : 0.18))
-            .overlay(alignment: .leading) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(.green)
-                    .scaleEffect(railGlyphScale(progress: progress, popped: thresholdSide == .done))
-                    .offset(x: min(progress * 0.12, 8))
-                    .padding(.leading, 18)
-            }
-            .opacity(railOpacity(progress: progress))
-    }
-
-    private var snoozeRail: some View {
-        let progress = max(-dragX, 0)
-        return RoundedRectangle(cornerRadius: 8)
-            .fill(Color.indigo.opacity(thresholdSide == .snooze ? 0.30 : 0.18))
-            .overlay(alignment: .trailing) {
-                Image(systemName: "moon.zzz.fill")
-                    .font(.system(size: 14, weight: .bold))
-                    .foregroundStyle(.indigo)
-                    .scaleEffect(railGlyphScale(progress: progress, popped: thresholdSide == .snooze))
-                    .offset(x: -min(progress * 0.12, 8))
-                    .padding(.trailing, 18)
-            }
-            .opacity(railOpacity(progress: progress))
-    }
-
-    private func railOpacity(progress: CGFloat) -> CGFloat {
-        min(max((progress - 8) / 32, 0), 1)
-    }
-
-    private func railGlyphScale(progress: CGFloat, popped: Bool) -> CGFloat {
-        let grown = 0.7 + 0.3 * min(progress / DumpUI.Motion.Swipe.commitThreshold, 1)
-        return popped ? grown * 1.15 : grown
-    }
-
     private var metadata: some View {
-        HStack(spacing: 6) {
+        FlowLayout(spacing: 6) {
             if item.isLater, let wake = item.wakeAt {
                 chipMenu {
                     snoozeMenuChoices
@@ -1145,7 +1253,6 @@ private struct QueueRow: View {
             if let confidence = item.metadataConfidence, confidence > 0, confidence < 0.55 {
                 ChipLabel(icon: "questionmark.diamond", text: "low confidence", color: .secondary)
             }
-            Spacer(minLength: 0)
         }
     }
 
@@ -1163,28 +1270,36 @@ private struct QueueRow: View {
     }
 
     private func chipMenu(
-        @ViewBuilder _ content: () -> some View,
-        @ViewBuilder label: () -> some View
+        @ViewBuilder _ content: @escaping () -> some View,
+        @ViewBuilder label: @escaping () -> some View
     ) -> some View {
+        ChipMenu(content: content, label: label)
+    }
+}
+
+/// Wraps a queue row's metadata chip menus with hover feedback so they read
+/// as pressable rather than dead labels.
+private struct ChipMenu<C: View, L: View>: View {
+    @ViewBuilder var content: () -> C
+    @ViewBuilder var label: () -> L
+    @State private var hovering = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
         Menu(content: content, label: label)
             .menuStyle(.button)
-            .buttonStyle(.plain)
+            .buttonStyle(PressableButtonStyle(pressedScale: 0.94))
             .menuIndicator(.hidden)
             .fixedSize()
+            .brightness(hovering ? 0.08 : 0)
+            .onHover { hovering = $0 }
+            .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: hovering)
     }
 }
 
 // MARK: - Queue content surfaces
 
 private enum QueueSurface {
-    static var contentFill: Color {
-        Color(nsColor: .textBackgroundColor).opacity(0.9)
-    }
-
-    static var contentStroke: Color {
-        Color(nsColor: .separatorColor).opacity(0.65)
-    }
-
     static var rowFill: Color {
         Color(nsColor: .controlBackgroundColor).opacity(0.74)
     }
@@ -1224,23 +1339,5 @@ private struct CompletionBounce: ViewModifier {
         } else {
             content
         }
-    }
-}
-
-private struct QueueQuietSurface: ViewModifier {
-    let cornerRadius: CGFloat
-
-    func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: cornerRadius)
-
-        content
-            .background(shape.fill(QueueSurface.contentFill))
-            .overlay(shape.strokeBorder(QueueSurface.contentStroke, lineWidth: 0.5))
-    }
-}
-
-private extension View {
-    func queueQuietSurface(cornerRadius: CGFloat) -> some View {
-        modifier(QueueQuietSurface(cornerRadius: cornerRadius))
     }
 }

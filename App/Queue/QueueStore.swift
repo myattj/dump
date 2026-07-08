@@ -185,6 +185,28 @@ public actor QueueStore {
         _ = await scheduler.reconcile()
     }
 
+    /// Writes a newly captured entry into the inbox. Runs on the store's
+    /// actor so the file IO doesn't block the main actor during capture.
+    public func add(
+        body: String,
+        seed: @escaping @Sendable (inout Frontmatter) -> Void
+    ) throws -> MarkdownWriter.WriteResult {
+        try writer.write(body: body, into: storage.subdirectory(.inbox), source: .capture, seedFrontmatter: seed)
+    }
+
+    /// Merges classifier output into an existing entry's frontmatter. Runs
+    /// on the store's actor so the read/decode/rewrite happens off the main
+    /// actor.
+    public func applyClassification(
+        at url: URL,
+        merge: @Sendable (inout Frontmatter) -> Void
+    ) throws {
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        var (fm, _) = try FrontmatterCodec.decode(raw)
+        merge(&fm)
+        try writer.rewriteFrontmatter(at: url, with: fm)
+    }
+
     private func scanInbox() -> [ScannedEntry] {
         let inbox = storage.subdirectory(.inbox)
         guard let urls = try? FileManager.default.contentsOfDirectory(

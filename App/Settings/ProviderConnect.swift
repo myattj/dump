@@ -4,6 +4,8 @@ public enum ProviderConnect {
     public static let anthropicAPIKeysURL = URL(string: "https://console.anthropic.com/settings/keys")!
     public static let openAIAPIKeysURL = URL(string: "https://platform.openai.com/api-keys")!
     public static let bedrockModelAccessURL = URL(string: "https://console.aws.amazon.com/bedrock/home#/modelaccess")!
+    public static let claudeCodeAuthURL = URL(string: "https://docs.anthropic.com/en/docs/claude-code/iam")!
+    public static let codexAuthURL = URL(string: "https://developers.openai.com/codex/auth")!
 
     public static let openAIBaseURL = "https://api.openai.com/v1"
     public static let openAIClassifierModel = "gpt-4o-mini"

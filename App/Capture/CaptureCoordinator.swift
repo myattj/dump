@@ -30,7 +30,7 @@ public final class CaptureCoordinator: ObservableObject {
     }()
 
     public private(set) lazy var meetingWindow: CaptureWindowController = {
-        CaptureWindowController { [weak self] body in
+        CaptureWindowController(positionKey: "dump.capture.meeting.origin") { [weak self] body in
             await self?.handleSubmission(body: body, source: .meeting)
         }
     }()
@@ -41,6 +41,7 @@ public final class CaptureCoordinator: ObservableObject {
         classifier: ClassifierHub,
         scheduler: SchedulerService,
         daemon: QMDDaemonController,
+        queryEngine: QueryEngine? = nil,
         onQueueChanged: @escaping @MainActor @Sendable () -> Void = {}
     ) {
         self.storage = storage
@@ -48,7 +49,7 @@ public final class CaptureCoordinator: ObservableObject {
         self.classifier = classifier
         self.scheduler = scheduler
         self.daemon = daemon
-        self.queryEngine = QueryEngine(daemon: daemon)
+        self.queryEngine = queryEngine ?? QueryEngine(daemon: daemon)
         self.pdfImporter = PDFImporter(storage: storage, writer: writer)
         self.onQueueChanged = onQueueChanged
     }
@@ -59,21 +60,40 @@ public final class CaptureCoordinator: ObservableObject {
     public func handleSubmission(body: String, source: Frontmatter.Source) async {
         let dir = storage.subdirectory(source == .meeting ? .meetings : .inbox)
         do {
-            let result = try writer.write(body: body, into: dir, source: source) { fm in
-                if source == .meeting {
-                    fm.type = .meeting
-                    fm.meetingDate = Date()
+            // Hop off the main actor: the committed-exit animation is ticking on the
+            // main thread right now, and createDirectory + the atomic write can stall
+            // on slow or synced volumes (the storage root is user-configurable).
+            let writer = self.writer
+            let result = try await Task.detached(priority: .userInitiated) {
+                try writer.write(body: body, into: dir, source: source) { fm in
+                    if source == .meeting {
+                        fm.type = .meeting
+                        fm.meetingDate = Date()
+                    }
                 }
-            }
+            }.value
             captureTick += 1
             await classifyAndPersist(at: result.url, body: body, source: source)
-            await indexUpdated(source: source)
-            await scheduler.reconcile()
+            // The queue scans frontmatter on disk (QueueStore.scanInbox) — it needs
+            // nothing from the qmd index or the scheduler. Refresh it as soon as the
+            // classified entry is durable, not after the qmd update/embed CLI runs.
             if source != .meeting {
                 onQueueChanged()
             }
+            await scheduler.reconcile()
+            await indexUpdated(source: source)
         } catch {
             log.error("capture write failed: \(String(describing: error), privacy: .public)")
+            // The panel already played the "sent" exit and the draft clears on
+            // next open — recover the text so nothing is lost.
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(body, forType: .string)
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Your note couldn't be saved"
+            alert.informativeText = "The text was copied to the clipboard so nothing is lost.\n\n\(error.localizedDescription)"
+            alert.runModal()
         }
     }
 
@@ -120,6 +140,12 @@ public final class CaptureCoordinator: ObservableObject {
             try? await queryEngine.embed()
         } catch {
             log.error("pdf import failed: \(String(describing: error), privacy: .public)")
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Couldn't import \u{201C}\(url.lastPathComponent)\u{201D}"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
         }
     }
 }

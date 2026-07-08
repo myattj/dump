@@ -7,7 +7,7 @@ public final class QueryCoordinator {
     public let window: QueryWindowController
 
     public init(storage: StoragePreference, daemon: QMDDaemonController, synthesizer: Synthesizing) {
-        let engine = QueryEngine(daemon: daemon)
+        let engine = QueryEngine(daemon: daemon, storage: storage)
         let vm = QueryViewModel(engine: engine, synthesizer: synthesizer)
         self.viewModel = vm
         self.window = QueryWindowController(viewModel: vm)

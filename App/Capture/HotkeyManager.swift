@@ -38,6 +38,18 @@ public final class HotkeyManager {
             KeyCombo(key: key, modifiers: modifiers).description
         }
 
+        /// Combos macOS itself owns; registering them as a global hotkey
+        /// would either shadow the system shortcut everywhere (Cmd+Q) or
+        /// silently fail to register (Cmd+Space).
+        public var isSystemReserved: Bool {
+            let reserved: [(Key, NSEvent.ModifierFlags)] = [
+                (.q, .command), (.w, .command), (.h, .command), (.m, .command),
+                (.tab, .command), (.space, .command), (.escape, [.command, .option]),
+                (.three, [.command, .shift]), (.four, [.command, .shift]), (.five, [.command, .shift]),
+            ]
+            return reserved.contains { key == $0.0 && modifiers == $0.1 }
+        }
+
         public static let defaultCapture = Binding(key: .d, modifiers: [.command, .shift])
         public static let defaultQuery = Binding(key: .f, modifiers: [.command, .shift])
         public static let defaultQueue = Binding(key: .t, modifiers: [.command, .shift])
@@ -74,8 +86,32 @@ public final class HotkeyManager {
 
     public init() {}
 
-    public func register(_ action: Action, binding: Binding, handler: @escaping @MainActor () -> Void) {
+    @discardableResult
+    public func register(_ action: Action, binding: Binding, handler: @escaping @MainActor () -> Void) -> Bool {
         registrations[action] = nil
+        handlers[action] = nil
+        // The HotKey package discards RegisterEventHotKey's OSStatus, so
+        // probe first with the SAME non-exclusive options (0) it uses —
+        // the probe fails exactly when the real registration would
+        // (exclusive holder elsewhere, invalid combo). Do NOT probe with
+        // kEventHotKeyExclusive: that also fails against non-exclusive
+        // holders that coexist fine with Dump today.
+        var probe: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            binding.keyCode, binding.carbonModifiers,
+            EventHotKeyID(signature: OSType(0x44554D50) /* 'DUMP' */, id: 0),
+            GetEventDispatcherTarget(), 0, &probe
+        )
+        guard status == noErr, let acquired = probe else {
+            DiagnosticLog.event(.error, category: "hotkeys", "hotkey registration failed", metadata: [
+                "action": action.rawValue,
+                "binding": binding.displayString,
+                "status": String(status),
+            ])
+            return false
+        }
+        UnregisterEventHotKey(acquired)
+
         let hk = HotKey(key: binding.key, modifiers: binding.modifiers)
         hk.keyDownHandler = { [weak self] in
             guard let self else { return }
@@ -85,6 +121,7 @@ public final class HotkeyManager {
         }
         registrations[action] = hk
         handlers[action] = handler
+        return true
     }
 
     public func unregister(_ action: Action) {
@@ -95,6 +132,13 @@ public final class HotkeyManager {
     public func unregisterAll() {
         registrations.removeAll()
         handlers.removeAll()
+    }
+
+    /// Pauses (or resumes) every live-registered hotkey without unregistering
+    /// them, so recording a new combo in Settings can't be shadowed by a
+    /// combo that's already bound to another action.
+    public func setPaused(_ paused: Bool) {
+        for hotKey in registrations.values { hotKey.isPaused = paused }
     }
 
     public var registeredActions: Set<Action> {

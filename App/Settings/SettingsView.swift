@@ -16,18 +16,38 @@ public final class SettingsWindowController {
             let view = SettingsView(coordinator: coordinator)
             let host = NSHostingController(rootView: view)
             let w = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 560, height: 480),
+                contentRect: NSRect(x: 0, y: 0, width: 640, height: 560),
                 styleMask: [.titled, .closable, .miniaturizable],
                 backing: .buffered,
                 defer: false
             )
+            w.isReleasedWhenClosed = false // controller retains the window; AppKit must not release it on close
             w.title = "Dump Settings"
             w.contentViewController = host
-            w.center()
+            w.setFrameAutosaveName("dump.settings")
+            // Non-resizable styleMask: the plain autosave restore skips such windows,
+            // so force-apply the saved frame; center only on the very first open.
+            if !w.setFrameUsingName("dump.settings", force: true) {
+                w.center()
+            }
             window = w
         }
         NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        guard let window else { return }
+        if window.isVisible {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            // Same entrance grammar as onboarding and the floating panels
+            // (reduce motion just shortens the fade).
+            let reduced = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            window.alphaValue = 0
+            window.makeKeyAndOrderFront(nil)
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = reduced ? 0.12 : DumpUI.Motion.Window.showFadeDuration
+                ctx.timingFunction = DumpUI.Motion.Window.easeOutExpo
+                window.animator().alphaValue = 1
+            }
+        }
     }
 }
 
@@ -36,7 +56,9 @@ struct SettingsView: View {
 
     var body: some View {
         TabView {
-            GeneralSettingsView(storage: coordinator.storage, hotkeys: coordinator.hotkeyPreferences)
+            GeneralSettingsView(storage: coordinator.storage,
+                                 hotkeys: coordinator.hotkeyPreferences,
+                                 hotkeyManager: coordinator.hotkeys)
                 .tabItem { Label("General", systemImage: "gearshape") }
             ClassifierSettingsView(hub: coordinator.classifierHub)
                 .tabItem { Label("Classifier", systemImage: "brain") }
@@ -46,13 +68,14 @@ struct SettingsView: View {
                 .tabItem { Label("Updates", systemImage: "arrow.down.circle") }
         }
         .padding(20)
-        .frame(width: 560, height: 480)
+        .frame(width: 640, height: 560)
     }
 }
 
 struct GeneralSettingsView: View {
     let storage: StoragePreference
     @ObservedObject var hotkeys: HotkeyPreferenceStore
+    let hotkeyManager: HotkeyManager
     @State private var path: String = ""
     @State private var recordingAction: HotkeyManager.Action?
     @State private var hotkeyMessage: String?
@@ -84,6 +107,9 @@ struct GeneralSettingsView: View {
             }
         }
         .onAppear { path = storage.root.path }
+        .onChange(of: recordingAction) { _, newValue in
+            hotkeyManager.setPaused(newValue != nil)
+        }
     }
 
     private func hotkeyRow(for action: HotkeyManager.Action) -> some View {
@@ -110,7 +136,9 @@ struct GeneralSettingsView: View {
                 .frame(width: 0, height: 0)
             )
             Button("Clear") {
-                hotkeys.disable(action)
+                if hotkeys.binding(for: action) != nil {
+                    hotkeys.disable(action)
+                }
                 if recordingAction == action { recordingAction = nil }
                 hotkeyMessage = nil
             }
@@ -142,6 +170,12 @@ struct GeneralSettingsView: View {
         guard let binding = HotkeyManager.Binding(event: event) else {
             NSSound.beep()
             hotkeyMessage = "Use a modifier plus a key, or a function key."
+            return
+        }
+
+        if binding.isSystemReserved {
+            NSSound.beep()
+            hotkeyMessage = "\(binding.displayString) is reserved by macOS."
             return
         }
 
@@ -213,6 +247,15 @@ private struct HotkeyCaptureView: NSViewRepresentable {
             keyDown(with: event)
             return true
         }
+
+        // End recording whenever capture loses first responder (window
+        // closed or clicked away mid-recording), so hotkeys can never stay
+        // paused; the cached Settings window only orders out on close, so
+        // onDisappear is not a reliable signal.
+        override func resignFirstResponder() -> Bool {
+            onCancel?()
+            return super.resignFirstResponder()
+        }
     }
 }
 
@@ -221,6 +264,9 @@ struct ClassifierSettingsView: View {
     @State private var mode: ClassifierMode = .cloud
     @State private var apiKey: String = ""
     @State private var anthropicEndpoint: String = ""
+    @State private var planBackedProvider: PlanBackedProvider = .claudeCode
+    @State private var claudeCodeExecutablePath: String = ""
+    @State private var codexExecutablePath: String = ""
     @State private var customBaseURL: String = ""
     @State private var customClassifierModel: String = ""
     @State private var customSynthesizerModel: String = ""
@@ -259,6 +305,7 @@ struct ClassifierSettingsView: View {
         Form {
             Picker("Mode", selection: $mode) {
                 Text("Cloud (Claude)").tag(ClassifierMode.cloud)
+                Text("Plans (Codex/Claude)").tag(ClassifierMode.subscription)
                 Text("Local (Ollama)").tag(ClassifierMode.local)
                 Text("OpenAI-compatible").tag(ClassifierMode.custom)
                 Text("Amazon Bedrock").tag(ClassifierMode.bedrock)
@@ -282,8 +329,12 @@ struct ClassifierSettingsView: View {
                             importAnthropicEnvironmentKey()
                         }
                         Button("Save API key") {
-                            try? KeychainStore.shared.set(apiKey, for: .anthropicAPIKey)
-                            flash("Saved")
+                            do {
+                                try KeychainStore.shared.set(apiKey, for: .anthropicAPIKey)
+                                flash("Saved")
+                            } catch {
+                                flash("Couldn't save to Keychain", success: false)
+                            }
                         }
                     }
                 }
@@ -297,6 +348,47 @@ struct ClassifierSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     Button("Save endpoint") {
                         configStore.anthropicEndpoint = anthropicEndpoint
+                        flash("Saved")
+                    }
+                }
+                }
+                .transition(modeSectionTransition)
+            } else if mode == .subscription {
+                Group {
+                Section("Plan-backed local CLI") {
+                    Picker("Provider", selection: $planBackedProvider) {
+                        ForEach(PlanBackedProvider.allCases) { provider in
+                            Text(provider.title).tag(provider)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("Uses the official CLI login on this Mac. Dump auto-detects common Homebrew and shell PATH locations, then stores CLI paths only.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("Detect CLIs") {
+                            detectPlanBackedExecutables()
+                        }
+                        Button("Open Claude auth") {
+                            open(ProviderConnect.claudeCodeAuthURL)
+                        }
+                        Button("Open Codex auth") {
+                            open(ProviderConnect.codexAuthURL)
+                        }
+                    }
+                }
+                Section("CLI paths") {
+                    LabeledContent("Claude CLI") {
+                        TextField("Claude CLI", text: $claudeCodeExecutablePath)
+                            .labelsHidden()
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    LabeledContent("Codex CLI") {
+                        TextField("Codex CLI", text: $codexExecutablePath)
+                            .labelsHidden()
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    Button("Save plan settings") {
+                        persistPlanBackedSettings()
                         flash("Saved")
                     }
                 }
@@ -362,8 +454,12 @@ struct ClassifierSettingsView: View {
                         configStore.baseURL = customBaseURL
                         configStore.classifierModel = customClassifierModel
                         configStore.synthesizerModel = customSynthesizerModel
-                        try? KeychainStore.shared.set(customAPIKey, for: .customLLMAPIKey)
-                        flash("Saved")
+                        do {
+                            try KeychainStore.shared.set(customAPIKey, for: .customLLMAPIKey)
+                            flash("Saved")
+                        } catch {
+                            flash("Couldn't save to Keychain", success: false)
+                        }
                     }
                 }
                 }
@@ -418,8 +514,11 @@ struct ClassifierSettingsView: View {
                             importBedrockEnvironmentCredentials()
                         }
                         Button("Save AWS credentials") {
-                            persistBedrockSettings()
-                            flash("Saved")
+                            if persistBedrockSettings() {
+                                flash("Saved")
+                            } else {
+                                flash("Couldn't save to Keychain", success: false)
+                            }
                         }
                     }
                 }
@@ -440,11 +539,18 @@ struct ClassifierSettingsView: View {
                     ))
             }
         }
+        .formStyle(.grouped)  // grouped Forms are List-backed and scroll; the default .columns style clips inside the fixed 640x560 window
         .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: mode)
         .task {
             self.mode = await hub.mode
             self.apiKey = KeychainStore.shared.string(for: .anthropicAPIKey) ?? ""
             self.anthropicEndpoint = configStore.anthropicEndpoint
+            self.planBackedProvider = configStore.planBackedProvider
+            self.claudeCodeExecutablePath = configStore.claudeCodeExecutablePath
+            self.codexExecutablePath = configStore.codexExecutablePath
+            if applyDetectedPlanBackedExecutables(overwriteExistingPaths: false) {
+                persistPlanBackedSettings()
+            }
             self.customBaseURL = configStore.baseURL
             self.customClassifierModel = configStore.classifierModel
             self.customSynthesizerModel = configStore.synthesizerModel
@@ -487,8 +593,12 @@ struct ClassifierSettingsView: View {
             return
         }
         apiKey = key
-        try? KeychainStore.shared.set(key, for: .anthropicAPIKey)
-        flash("Imported ANTHROPIC_API_KEY")
+        do {
+            try KeychainStore.shared.set(key, for: .anthropicAPIKey)
+            flash("Imported ANTHROPIC_API_KEY")
+        } catch {
+            flash("Couldn't save to Keychain", success: false)
+        }
     }
 
     private func configureOpenAIDefaults() {
@@ -510,8 +620,83 @@ struct ClassifierSettingsView: View {
         }
         customAPIKey = key
         configureOpenAIDefaults()
-        try? KeychainStore.shared.set(key, for: .customLLMAPIKey)
-        flash("Imported OPENAI_API_KEY")
+        do {
+            try KeychainStore.shared.set(key, for: .customLLMAPIKey)
+            flash("Imported OPENAI_API_KEY")
+        } catch {
+            flash("Couldn't save to Keychain", success: false)
+        }
+    }
+
+    private func detectPlanBackedExecutables() {
+        let detection = PlanBackedExecutableResolver.detect()
+        guard !detection.isEmpty else {
+            flash("No local CLIs found", success: false)
+            return
+        }
+        applyDetectedPlanBackedExecutables(detection, overwriteExistingPaths: true)
+        persistPlanBackedSettings()
+        flash("Detected local CLIs")
+    }
+
+    @discardableResult
+    private func applyDetectedPlanBackedExecutables(
+        _ detection: PlanBackedExecutableDetection = PlanBackedExecutableResolver.detect(),
+        overwriteExistingPaths: Bool
+    ) -> Bool {
+        var didChange = false
+        if shouldApplyDetectedPath(
+            detection.claudeCodePath,
+            currentPath: claudeCodeExecutablePath,
+            overwriteExistingPaths: overwriteExistingPaths
+        ) {
+            claudeCodeExecutablePath = detection.claudeCodePath
+            didChange = true
+        }
+        if shouldApplyDetectedPath(
+            detection.codexPath,
+            currentPath: codexExecutablePath,
+            overwriteExistingPaths: overwriteExistingPaths
+        ) {
+            codexExecutablePath = detection.codexPath
+            didChange = true
+        }
+
+        let availableProviders = PlanBackedProvider.allCases.filter { provider in
+            !pathField(for: provider).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if !availableProviders.contains(planBackedProvider), let fallbackProvider = availableProviders.first {
+            planBackedProvider = fallbackProvider
+            didChange = true
+        }
+        return didChange
+    }
+
+    private func shouldApplyDetectedPath(
+        _ detectedPath: String,
+        currentPath: String,
+        overwriteExistingPaths: Bool
+    ) -> Bool {
+        guard !detectedPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        guard overwriteExistingPaths || currentPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return currentPath != detectedPath
+    }
+
+    private func pathField(for provider: PlanBackedProvider) -> String {
+        switch provider {
+        case .claudeCode: return claudeCodeExecutablePath
+        case .codex: return codexExecutablePath
+        }
+    }
+
+    private func persistPlanBackedSettings() {
+        configStore.planBackedProvider = planBackedProvider
+        configStore.claudeCodeExecutablePath = claudeCodeExecutablePath
+        configStore.codexExecutablePath = codexExecutablePath
     }
 
     private func configureBedrockDefaults() {
@@ -550,7 +735,8 @@ struct ClassifierSettingsView: View {
         flash("Imported AWS env vars")
     }
 
-    private func persistBedrockSettings() {
+    @discardableResult
+    private func persistBedrockSettings() -> Bool {
         let synthesizerModelID: String
         if bedrockSynthesizerModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             synthesizerModelID = bedrockClassifierModelID
@@ -560,9 +746,14 @@ struct ClassifierSettingsView: View {
         configStore.bedrockRegion = bedrockRegion
         configStore.bedrockClassifierModelID = bedrockClassifierModelID
         configStore.bedrockSynthesizerModelID = synthesizerModelID
-        try? KeychainStore.shared.set(bedrockAccessKeyID, for: .bedrockAccessKeyID)
-        try? KeychainStore.shared.set(bedrockSecretAccessKey, for: .bedrockSecretAccessKey)
-        try? KeychainStore.shared.set(bedrockSessionToken, for: .bedrockSessionToken)
+        do {
+            try KeychainStore.shared.set(bedrockAccessKeyID, for: .bedrockAccessKeyID)
+            try KeychainStore.shared.set(bedrockSecretAccessKey, for: .bedrockSecretAccessKey)
+            try KeychainStore.shared.set(bedrockSessionToken, for: .bedrockSessionToken)
+            return true
+        } catch {
+            return false
+        }
     }
 
     private func persistOpenAICompatibleSettings() {
@@ -576,6 +767,7 @@ struct CodeCollectionsSettingsView: View {
     let daemon: QMDDaemonController
     @State private var collections: [CodeCollectionStore.Collection] = []
     @State private var newName: String = ""
+    @State private var addError: String?
 
     var body: some View {
         VStack(alignment: .leading) {
@@ -585,12 +777,26 @@ struct CodeCollectionsSettingsView: View {
                     Text(c.rootPath).font(.caption).foregroundStyle(.secondary)
                 }
             }
+            .overlay {
+                if collections.isEmpty {
+                    ContentUnavailableView(
+                        "No code collections",
+                        systemImage: "folder.badge.plus",
+                        description: Text("Name a collection and choose a folder to index.")
+                    )
+                }
+            }
             HStack {
                 LabeledContent("Collection name") {
                     TextField("Collection name", text: $newName)
                         .labelsHidden()
                 }
                 Button("Add folder…") { addFolder() }
+            }
+            if let addError {
+                Text(addError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
             }
         }
         .task { await refresh() }
@@ -604,9 +810,14 @@ struct CodeCollectionsSettingsView: View {
         if panel.runModal() == .OK, let url = panel.url {
             Task {
                 let store = CodeCollectionStore(engine: QueryEngine(daemon: daemon))
-                _ = try? await store.add(name: newName, root: url)
+                do {
+                    _ = try await store.add(name: newName, root: url)
+                    newName = ""
+                    addError = nil
+                } catch {
+                    addError = "Couldn't add \u{201C}\(newName)\u{201D}: \(error.localizedDescription)"
+                }
                 await refresh()
-                newName = ""
             }
         }
     }

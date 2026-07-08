@@ -17,6 +17,9 @@ public final class CustomLLMConfigStore: @unchecked Sendable {
         public static let bedrockRegion = "dump.classifier.bedrock.region"
         public static let bedrockClassifierModelID = "dump.classifier.bedrock.classifierModelID"
         public static let bedrockSynthesizerModelID = "dump.classifier.bedrock.synthesizerModelID"
+        public static let planBackedProvider = "dump.classifier.plan.provider"
+        public static let claudeCodeExecutablePath = "dump.classifier.plan.claudeCodeExecutablePath"
+        public static let codexExecutablePath = "dump.classifier.plan.codexExecutablePath"
     }
 
     private let defaults: UserDefaults
@@ -78,6 +81,26 @@ public final class CustomLLMConfigStore: @unchecked Sendable {
     public var bedrockSynthesizerModelID: String {
         get { defaults.string(forKey: DefaultsKey.bedrockSynthesizerModelID) ?? "" }
         set { defaults.set(newValue, forKey: DefaultsKey.bedrockSynthesizerModelID) }
+    }
+
+    /// Which local official CLI powers plan-backed usage. The selected CLI
+    /// owns authentication with the user's paid ChatGPT or Claude plan.
+    public var planBackedProvider: PlanBackedProvider {
+        get {
+            let raw = defaults.string(forKey: DefaultsKey.planBackedProvider) ?? PlanBackedProvider.claudeCode.rawValue
+            return PlanBackedProvider(rawValue: raw) ?? .claudeCode
+        }
+        set { defaults.set(newValue.rawValue, forKey: DefaultsKey.planBackedProvider) }
+    }
+
+    public var claudeCodeExecutablePath: String {
+        get { defaults.string(forKey: DefaultsKey.claudeCodeExecutablePath) ?? "" }
+        set { defaults.set(newValue, forKey: DefaultsKey.claudeCodeExecutablePath) }
+    }
+
+    public var codexExecutablePath: String {
+        get { defaults.string(forKey: DefaultsKey.codexExecutablePath) ?? "" }
+        set { defaults.set(newValue, forKey: DefaultsKey.codexExecutablePath) }
     }
 
     /// Resolves the Anthropic Messages URL the Claude clients should hit:

@@ -249,6 +249,16 @@ final class SynthesizerHubTests: XCTestCase {
         XCTAssertEqual(r.text, "from custom")
     }
 
+    func testSubscriptionModeRoutesToPlanBacked() async throws {
+        let claude = StubSynth(answer: "from claude")
+        let planBacked = StubSynth(answer: "from plan")
+        let defaults = UserDefaults(suiteName: "hub-synth-\(UUID().uuidString)")!
+        defaults.set(ClassifierMode.subscription.rawValue, forKey: ClassifierModePreference.defaultsKey)
+        let hub = SynthesizerHub(defaults: defaults, claude: claude, planBacked: planBacked)
+        let r = try await hub.synthesize(query: "Q", hits: [])
+        XCTAssertEqual(r.text, "from plan")
+    }
+
     func testLocalModeRoutesToOllama() async throws {
         let claude = StubSynth(answer: "from claude")
         let ollama = StubSynth(answer: "from ollama")
@@ -315,6 +325,30 @@ final class ClassifierHubCustomRoutingTests: XCTestCase {
         let id = await hub.activeIdentifier
         XCTAssertEqual(id, "bedrock")
     }
+
+    func testSubscriptionModeRoutesToPlanBacked() async {
+        let claude = ProbeClassifier(id: "claude")
+        let planBacked = ProbeClassifier(id: "plan")
+        let ollama = ProbeClassifier(id: "ollama")
+        let custom = ProbeClassifier(id: "custom")
+        let bedrock = ProbeClassifier(id: "bedrock")
+        let defaults = UserDefaults(suiteName: "hub-\(UUID().uuidString)")!
+        let hub = ClassifierHub(
+            keychain: KeychainStore(service: "test.\(UUID())"),
+            defaults: defaults,
+            claude: claude,
+            planBacked: planBacked,
+            ollama: ollama,
+            custom: custom,
+            bedrock: bedrock
+        )
+        await hub.setMode(.subscription)
+        _ = await hub.classify("hi")
+        XCTAssertEqual(planBacked.calls, 1)
+        XCTAssertEqual(claude.calls, 0)
+        let id = await hub.activeIdentifier
+        XCTAssertEqual(id, "plan")
+    }
 }
 
 final class CustomLLMConfigStoreTests: XCTestCase {
@@ -364,5 +398,149 @@ private struct StubSynth: Synthesizing {
     let answer: String
     func synthesize(query: String, hits: [QueryEngine.Hit]) async throws -> SynthesisResult {
         SynthesisResult(text: answer, citations: [])
+    }
+}
+
+// MARK: - Streaming synthesis
+
+final class StreamingSynthesisTests: XCTestCase {
+    private func collect(_ stream: AsyncThrowingStream<String, Error>) async throws -> [String] {
+        var deltas: [String] = []
+        for try await delta in stream { deltas.append(delta) }
+        return deltas
+    }
+
+    private func queryHit() -> QueryEngine.Hit {
+        QueryEngine.Hit(docid: "d1", file: "notes/a.md", title: "A", score: 1.0, context: nil, snippet: "alpha")
+    }
+
+    func testClaudeStreamParsesSSEDeltas() async throws {
+        let keychain = InMemoryKeychain()
+        try keychain.set("sk-ant-test", for: .anthropicAPIKey)
+        let transport = MockHTTPTransport()
+        let sse = """
+        event: message_start
+        data: {"type":"message_start"}
+        data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}
+        data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" world [1]"}}
+        data: {"type":"message_stop"}
+        """
+        transport.setFallback { _ in
+            HTTPResponse(status: 200, headers: [:], body: Data(sse.utf8))
+        }
+        let synth = ClaudeSynthesizer(keychain: keychain.asKeychainStore(), transport: transport)
+        let deltas = try await collect(synth.synthesizeStream(query: "q", hits: [queryHit()]))
+        XCTAssertEqual(deltas, ["Hello", " world [1]"])
+    }
+
+    func testClaudeStreamSurfacesMidStreamErrorEvent() async throws {
+        let keychain = InMemoryKeychain()
+        try keychain.set("sk-ant-test", for: .anthropicAPIKey)
+        let transport = MockHTTPTransport()
+        let sse = """
+        data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}
+        data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+        """
+        transport.setFallback { _ in
+            HTTPResponse(status: 200, headers: [:], body: Data(sse.utf8))
+        }
+        let synth = ClaudeSynthesizer(keychain: keychain.asKeychainStore(), transport: transport)
+        do {
+            _ = try await collect(synth.synthesizeStream(query: "q", hits: []))
+            XCTFail("expected upstream error")
+        } catch let ClaudeSynthesizer.SynthesisError.upstream(status, message) {
+            XCTAssertEqual(status, 200)
+            XCTAssertEqual(message, "Overloaded")
+        }
+    }
+
+    func testClaudeStreamMapsHTTPStatusToUpstream() async throws {
+        let keychain = InMemoryKeychain()
+        try keychain.set("sk-ant-test", for: .anthropicAPIKey)
+        let transport = MockHTTPTransport()
+        transport.setFallback { _ in
+            HTTPResponse(status: 429, headers: [:], body: Data("rate limited".utf8))
+        }
+        let synth = ClaudeSynthesizer(keychain: keychain.asKeychainStore(), transport: transport)
+        do {
+            _ = try await collect(synth.synthesizeStream(query: "q", hits: []))
+            XCTFail("expected upstream error")
+        } catch let ClaudeSynthesizer.SynthesisError.upstream(status, _) {
+            XCTAssertEqual(status, 429)
+        }
+    }
+
+    func testOllamaStreamParsesNDJSONAndStopsAtDone() async throws {
+        let transport = MockHTTPTransport()
+        let ndjson = """
+        {"message":{"role":"assistant","content":"Local"},"done":false}
+        {"message":{"role":"assistant","content":" answer"},"done":false}
+        {"message":{"role":"assistant","content":""},"done":true}
+        """
+        transport.setFallback { _ in
+            HTTPResponse(status: 200, headers: [:], body: Data(ndjson.utf8))
+        }
+        let synth = OllamaSynthesizer(
+            transport: transport,
+            endpoint: URL(string: "http://localhost:11434/api/chat")!,
+            model: "llama3"
+        )
+        let deltas = try await collect(synth.synthesizeStream(query: "q", hits: []))
+        XCTAssertEqual(deltas, ["Local", " answer"])
+    }
+
+    func testOllamaStreamSurfacesErrorLine() async throws {
+        let transport = MockHTTPTransport()
+        let ndjson = """
+        {"message":{"role":"assistant","content":"par"},"done":false}
+        {"error":"model ran out of memory"}
+        """
+        transport.setFallback { _ in
+            HTTPResponse(status: 200, headers: [:], body: Data(ndjson.utf8))
+        }
+        let synth = OllamaSynthesizer(
+            transport: transport,
+            endpoint: URL(string: "http://localhost:11434/api/chat")!,
+            model: "llama3"
+        )
+        do {
+            _ = try await collect(synth.synthesizeStream(query: "q", hits: []))
+            XCTFail("expected upstream error")
+        } catch let OllamaClassifier.OllamaError.upstream(status, message) {
+            XCTAssertEqual(status, 200)
+            XCTAssertEqual(message, "model ran out of memory")
+        }
+    }
+
+    func testCustomLLMStreamParsesSSEAndStopsAtDone() async throws {
+        let keychain = InMemoryKeychain()
+        try keychain.set("sk-test", for: .customLLMAPIKey)
+        let defaults = UserDefaults(suiteName: "stream-\(UUID().uuidString)")!
+        let store = CustomLLMConfigStore(defaults: defaults)
+        store.baseURL = "https://api.example.com/v1"
+        store.synthesizerModel = "gpt-test"
+        let transport = MockHTTPTransport()
+        let sse = """
+        data: {"choices":[{"delta":{"content":"Open"}}]}
+        data: {"choices":[{"delta":{"content":"AI style"}}]}
+        data: [DONE]
+        """
+        transport.setFallback { _ in
+            HTTPResponse(status: 200, headers: [:], body: Data(sse.utf8))
+        }
+        let synth = CustomLLMSynthesizer(
+            keychain: keychain.asKeychainStore(),
+            configStore: store,
+            transport: transport
+        )
+        let deltas = try await collect(synth.synthesizeStream(query: "q", hits: []))
+        XCTAssertEqual(deltas, ["Open", "AI style"])
+    }
+
+    func testDefaultStreamYieldsBufferedTextOnceAndSkipsEmpty() async throws {
+        let full = try await collect(StubSynth(answer: "whole answer").synthesizeStream(query: "q", hits: []))
+        XCTAssertEqual(full, ["whole answer"])
+        let empty = try await collect(StubSynth(answer: "").synthesizeStream(query: "q", hits: []))
+        XCTAssertEqual(empty, [])
     }
 }

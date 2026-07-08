@@ -14,23 +14,40 @@ public final class CaptureWindowController {
     // would re-close instead of re-opening.
     private var isShowing = false
     private var hideInFlight = false
-    private var deactivateObserver: NSObjectProtocol?
+    private var resignKeyObserver: NSObjectProtocol?
+    private var moveObserver: NSObjectProtocol?
+    /// Whoever was frontmost when the hotkey fired — dismissal returns
+    /// activation to them.
+    private var previousApp: NSRunningApplication?
     private let focusRequest = PanelFocusRequest()
     private let onSubmit: Submit
 
-    public init(onSubmit: @escaping Submit) {
+    /// Per-panel: the quick-capture and meeting-note panels must not
+    /// overwrite each other's remembered position.
+    private let positionKey: String
+
+    public init(positionKey: String = "dump.capture.origin", onSubmit: @escaping Submit) {
+        self.positionKey = positionKey
         self.onSubmit = onSubmit
-        // Replace `panel.hidesOnDeactivate = true` — that path orderOut's the
-        // panel without going through PanelAnimator, leaving our state out of
-        // sync with what the user sees. Route auto-dismiss through close() so
-        // the animation runs and `isShowing`/`panel` stay consistent.
-        deactivateObserver = NotificationCenter.default.addObserver(
-            forName: NSApplication.didResignActiveNotification,
+        // Transient-panel convention: dismiss when the panel stops being key —
+        // a click into another app or another Dump window. App-level
+        // didResignActive can't drive this: the panel is .nonactivatingPanel,
+        // so Dump usually was never the active app in the first place. Routing
+        // through close() keeps the exit animation and isShowing in sync
+        // (hidesOnDeactivate would orderOut behind PanelAnimator's back).
+        resignKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] note in
+            // Notification isn't Sendable — reduce to an identity before
+            // hopping onto the main actor.
+            let windowID = (note.object as? NSWindow).map(ObjectIdentifier.init)
             MainActor.assumeIsolated {
-                guard let self, self.isShowing else { return }
+                guard let self, self.isShowing,
+                      let windowID,
+                      let panel = self.panel,
+                      windowID == ObjectIdentifier(panel) else { return }
                 self.close()
             }
         }
@@ -64,29 +81,92 @@ public final class CaptureWindowController {
                 // User re-triggered during hide — re-present the same panel.
                 self.presentPanel()
             } else {
-                self.panel = nil
+                // Hand activation back to the app the hotkey interrupted —
+                // but only if we still hold it (a click-away means the user
+                // already chose somewhere else to be).
+                if NSApp.isActive, let previous = self.previousApp, !previous.isTerminated {
+                    NSApp.yieldActivation(to: previous)
+                    previous.activate()
+                }
+                self.previousApp = nil
             }
+            // Panel retained: hide() already orderOut'd it and reset its
+            // transform. Reopening skips the NSPanel + NSHostingController
+            // rebuild (near-zero latency to first keystroke), and a cancelled
+            // draft (@State text) survives Esc, click-away, and Cmd-Tab — the
+            // contract clearOnNextPresent is built around.
         }
     }
 
     private func presentPanel() {
         if panel == nil {
-            panel = Self.makePanel(
+            let p = Self.makePanel(
                 focusRequest: focusRequest,
                 onSubmit: onSubmit,
                 onClose: { [weak self] in self?.close() },
                 onCommitClose: { [weak self] in self?.close(intent: .committed) }
             )
+            // The panel ships two drag affordances — remember where the user
+            // puts it. Only visible-window moves are user drags; programmatic
+            // placement below always happens while hidden.
+            moveObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didMoveNotification,
+                object: p,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let panel = self.panel, panel.isVisible else { return }
+                    UserDefaults.standard.set(
+                        NSStringFromPoint(panel.frame.origin),
+                        forKey: self.positionKey
+                    )
+                }
+            }
+            panel = p
         }
         guard let panel else { return }
         // A re-show that interrupts the hide retargets in place instead of
-        // teleporting the still-visible panel to center.
+        // teleporting the still-visible panel.
         if !panel.isVisible {
-            panel.center()
+            position(panel)
         }
-        NSApp.activate(ignoringOtherApps: true)
-        PanelAnimator.show(panel)
+        // Activation is required for reliable keyboard delivery to a
+        // programmatically summoned panel — nonactivating key status is only
+        // guaranteed for click activation, and typing right after the hotkey
+        // must never leak into the previous app. Remember who was frontmost
+        // so close() can hand activation straight back (Spotlight-style);
+        // an LSUIElement app otherwise keeps it forever after orderOut.
+        if !NSApp.isActive {
+            previousApp = NSWorkspace.shared.frontmostApplication
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        PanelAnimator.show(panel, chromeMotion: false)
         focusRequest.request()
+    }
+
+    /// Saved drag position when the user has one (and it's still on a
+    /// connected screen); otherwise Spotlight placement — horizontally
+    /// centered, upper third, on the screen the cursor is on.
+    private func position(_ panel: NSPanel) {
+        if let saved = UserDefaults.standard.string(forKey: positionKey) {
+            let origin = NSPointFromString(saved)
+            let frame = NSRect(origin: origin, size: panel.frame.size)
+            if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(frame) }) {
+                panel.setFrameOrigin(origin)
+                return
+            }
+        }
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+        guard let vf = screen?.visibleFrame else {
+            panel.center()
+            return
+        }
+        let size = panel.frame.size
+        panel.setFrameOrigin(NSPoint(
+            x: vf.midX - size.width / 2,
+            y: vf.minY + vf.height * 0.62
+        ))
     }
 
     private static func makePanel(
@@ -106,6 +186,9 @@ public final class CaptureWindowController {
 
         let panel = DumpWindowChrome.makeFloatingPanel(style: .capture)
         panel.contentViewController = host
+        // Assigning contentViewController resizes the window to SwiftUI's
+        // fitting size — pin the intended panel size back deterministically.
+        panel.setContentSize(DumpPanelStyle.capture.size)
         return panel
     }
 }
@@ -135,12 +218,17 @@ struct CaptureView: View {
             VStack(alignment: .leading, spacing: 0) {
                 header
                 editor
-                if let preview = parsePreview {
-                    ParsePreviewStrip(preview: preview)
-                        .padding(.horizontal, 20)
-                        .padding(.bottom, 8)
-                        .transition(.opacity)
+                // Reserve the strip's slot so a completing token ("tomorrow", "30m")
+                // never reflows the editor mid-keystroke — only opacity animates:
+                ZStack(alignment: .leading) {
+                    if let preview = parsePreview {
+                        ParsePreviewStrip(preview: preview)
+                            .transition(.opacity)
+                    }
                 }
+                .frame(height: 22, alignment: .leading)
+                .padding(.horizontal, DumpUI.Spacing.gutter)
+                .padding(.bottom, 8)
                 footer
             }
         }
@@ -180,7 +268,7 @@ struct CaptureView: View {
             iconName: "square.and.pencil",
             title: "New entry",
             height: DumpUI.Controls.compactTitleStripHeight,
-            horizontalPadding: DumpUI.Spacing.xxxl
+            horizontalPadding: DumpUI.Spacing.gutter
         )
     }
 
@@ -197,8 +285,8 @@ struct CaptureView: View {
             // keystroke (typing never animates), fades back in over 100ms
             // when the last character is deleted.
             Text("What's on your mind?")
-                .font(.system(size: 17))
-                .foregroundColor(Color.primary.opacity(0.35))
+                .font(DumpUI.Typography.captureInput)
+                .foregroundStyle(.secondary)
                 .allowsHitTesting(false)
                 .opacity(text.isEmpty ? 1 : 0)
                 .animation(
@@ -206,7 +294,7 @@ struct CaptureView: View {
                     value: text.isEmpty
                 )
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, DumpUI.Spacing.gutter)
         .padding(.vertical, 10)
         .frame(minHeight: 80, alignment: .topLeading)
     }
@@ -229,7 +317,7 @@ struct CaptureView: View {
                     .transition(.opacity)
             }
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, DumpUI.Spacing.gutter)
         .padding(.vertical, 12)
         .background(.quaternary.opacity(0.4))
         .animation(resolved(Motion.micro, reduceMotion: reduceMotion), value: text.isEmpty)
@@ -295,7 +383,7 @@ private struct CaptureTextEditor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let textView = CaptureNSTextView()
         textView.delegate = context.coordinator
-        textView.font = .systemFont(ofSize: 17)
+        textView.font = .systemFont(ofSize: DumpUI.Typography.captureInputSize)
         textView.textColor = .labelColor
         textView.insertionPointColor = .labelColor
         textView.drawsBackground = false

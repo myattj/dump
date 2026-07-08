@@ -31,15 +31,25 @@ public final class OnboardingWindowController {
             }
             let host = NSHostingController(rootView: view)
             let w = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 540, height: 480),
+                contentRect: NSRect(x: 0, y: 0, width: 580, height: 520),
                 styleMask: [.titled, .closable],
                 backing: .buffered,
                 defer: false
             )
+            // Programmatic NSWindow defaults to isReleasedWhenClosed = true;
+            // combined with the strong `window` reference, a red-button close
+            // over-releases the window. Keep ownership with ARC.
+            w.isReleasedWhenClosed = false
             w.title = "Welcome to Dump"
             w.contentViewController = host
             w.center()
             window = w
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: w, queue: .main
+            ) { [weak self] _ in
+                // Posted on the main thread for a main-thread close.
+                MainActor.assumeIsolated { self?.window = nil }
+            }
         }
         NSApp.activate(ignoringOtherApps: true)
         guard let window else { return }
@@ -83,6 +93,9 @@ struct OnboardingView: View {
     @State private var direction: Int = 1
     @State private var mode: ClassifierMode = .cloud
     @State private var apiKey: String = ""
+    @State private var planBackedProvider: PlanBackedProvider = .claudeCode
+    @State private var claudeCodeExecutablePath: String = ""
+    @State private var codexExecutablePath: String = ""
     @State private var customBaseURL: String = ""
     @State private var customClassifierModel: String = ""
     @State private var customSynthesizerModel: String = ""
@@ -129,7 +142,7 @@ struct OnboardingView: View {
             .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: step)
         }
         .padding(24)
-        .frame(width: 540, height: 480)
+        .frame(width: 580, height: 520)
         .onAppear { loadProviderSettings() }
     }
 
@@ -238,6 +251,7 @@ struct OnboardingView: View {
                 .reveal(0, reduceMotion: reduceMotion)
             Picker("Mode", selection: $mode) {
                 Text("Claude (Anthropic API)").tag(ClassifierMode.cloud)
+                Text("Use my paid plan").tag(ClassifierMode.subscription)
                 Text("OpenAI-compatible provider").tag(ClassifierMode.custom)
                 Text("Amazon Bedrock").tag(ClassifierMode.bedrock)
                 Text("Local (Ollama)").tag(ClassifierMode.local)
@@ -259,6 +273,8 @@ struct OnboardingView: View {
         switch mode {
         case .cloud:
             return "Use Anthropic's Messages API with a Claude model managed by Dump."
+        case .subscription:
+            return "Use your local Claude Code or Codex login. Dump stores only CLI paths and leaves plan auth with the official tools."
         case .custom:
             return "Use OpenAI, Azure OpenAI, OpenRouter, LiteLLM, vLLM, or another HTTPS endpoint that speaks Chat Completions."
         case .bedrock:
@@ -282,6 +298,42 @@ struct OnboardingView: View {
                 Text("Stored in your macOS Keychain, only on this device.")
                     .font(.caption).foregroundStyle(.secondary)
                     .reveal(2, reduceMotion: reduceMotion)
+
+            case .subscription:
+                Text("Use your existing plan").font(.title2).bold()
+                    .reveal(0, reduceMotion: reduceMotion)
+                Picker("Provider", selection: $planBackedProvider) {
+                    ForEach(PlanBackedProvider.allCases) { provider in
+                        Text(provider.title).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .reveal(1, reduceMotion: reduceMotion)
+                LabeledContent("Claude CLI") {
+                    TextField("Claude CLI", text: $claudeCodeExecutablePath)
+                        .labelsHidden()
+                }
+                .reveal(2, reduceMotion: reduceMotion)
+                LabeledContent("Codex CLI") {
+                    TextField("Codex CLI", text: $codexExecutablePath)
+                        .labelsHidden()
+                }
+                .reveal(3, reduceMotion: reduceMotion)
+                HStack {
+                    Button("Detect CLIs") {
+                        detectPlanBackedExecutables()
+                    }
+                    Button("Claude auth") {
+                        open(ProviderConnect.claudeCodeAuthURL)
+                    }
+                    Button("Codex auth") {
+                        open(ProviderConnect.codexAuthURL)
+                    }
+                }
+                .reveal(4, reduceMotion: reduceMotion)
+                Text("Run the official CLI login first. Dump auto-detects common install locations and stores paths only.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .reveal(5, reduceMotion: reduceMotion)
 
             case .custom:
                 Text("Configure your API provider").font(.title2).bold()
@@ -345,7 +397,7 @@ struct OnboardingView: View {
                 .reveal(6, reduceMotion: reduceMotion)
 
             case .local:
-                Text("Ollama check").font(.title2).bold()
+                Text("Configure Ollama").font(.title2).bold()
                     .reveal(0, reduceMotion: reduceMotion)
                 LabeledContent("Base URL") {
                     TextField("Base URL", text: $ollamaBaseURL)
@@ -369,6 +421,12 @@ struct OnboardingView: View {
 
     private func loadProviderSettings() {
         apiKey = KeychainStore.shared.string(for: .anthropicAPIKey) ?? ""
+        planBackedProvider = configStore.planBackedProvider
+        claudeCodeExecutablePath = configStore.claudeCodeExecutablePath
+        codexExecutablePath = configStore.codexExecutablePath
+        if applyDetectedPlanBackedExecutables(overwriteExistingPaths: false) {
+            persistPlanBackedSettings()
+        }
         customBaseURL = configStore.baseURL.isEmpty ? ProviderConnect.openAIBaseURL : configStore.baseURL
         customClassifierModel = configStore.classifierModel.isEmpty ? ProviderConnect.openAIClassifierModel : configStore.classifierModel
         customSynthesizerModel = configStore.synthesizerModel.isEmpty ? ProviderConnect.openAISynthesizerModel : configStore.synthesizerModel
@@ -391,10 +449,99 @@ struct OnboardingView: View {
         bedrockSessionToken = KeychainStore.shared.string(for: .bedrockSessionToken) ?? ""
     }
 
+    private func open(_ url: URL) {
+        NSWorkspace.shared.open(url)
+    }
+
+    // Onboarding has no confirmation UI to lie with, but a swallowed
+    // Keychain write here means the classifier is silently dead after
+    // setup; log it so it's discoverable in Diagnostics.
+    private func logKeychainFailure(_ error: Error) {
+        DiagnosticLog.event(.error, category: "onboarding", "keychain write failed", metadata: [
+            "error": String(describing: error),
+        ])
+    }
+
+    private func detectPlanBackedExecutables() {
+        let detection = PlanBackedExecutableResolver.detect()
+        guard !detection.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        applyDetectedPlanBackedExecutables(detection, overwriteExistingPaths: true)
+        persistPlanBackedSettings()
+    }
+
+    @discardableResult
+    private func applyDetectedPlanBackedExecutables(
+        _ detection: PlanBackedExecutableDetection = PlanBackedExecutableResolver.detect(),
+        overwriteExistingPaths: Bool
+    ) -> Bool {
+        var didChange = false
+        if shouldApplyDetectedPath(
+            detection.claudeCodePath,
+            currentPath: claudeCodeExecutablePath,
+            overwriteExistingPaths: overwriteExistingPaths
+        ) {
+            claudeCodeExecutablePath = detection.claudeCodePath
+            didChange = true
+        }
+        if shouldApplyDetectedPath(
+            detection.codexPath,
+            currentPath: codexExecutablePath,
+            overwriteExistingPaths: overwriteExistingPaths
+        ) {
+            codexExecutablePath = detection.codexPath
+            didChange = true
+        }
+
+        let availableProviders = PlanBackedProvider.allCases.filter { provider in
+            !pathField(for: provider).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if !availableProviders.contains(planBackedProvider), let fallbackProvider = availableProviders.first {
+            planBackedProvider = fallbackProvider
+            didChange = true
+        }
+        return didChange
+    }
+
+    private func shouldApplyDetectedPath(
+        _ detectedPath: String,
+        currentPath: String,
+        overwriteExistingPaths: Bool
+    ) -> Bool {
+        guard !detectedPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        guard overwriteExistingPaths || currentPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return currentPath != detectedPath
+    }
+
+    private func pathField(for provider: PlanBackedProvider) -> String {
+        switch provider {
+        case .claudeCode: return claudeCodeExecutablePath
+        case .codex: return codexExecutablePath
+        }
+    }
+
+    private func persistPlanBackedSettings() {
+        configStore.planBackedProvider = planBackedProvider
+        configStore.claudeCodeExecutablePath = claudeCodeExecutablePath
+        configStore.codexExecutablePath = codexExecutablePath
+    }
+
     private func persistSelectedProvider() {
         switch mode {
         case .cloud:
-            try? KeychainStore.shared.set(apiKey, for: .anthropicAPIKey)
+            do {
+                try KeychainStore.shared.set(apiKey, for: .anthropicAPIKey)
+            } catch {
+                logKeychainFailure(error)
+            }
+        case .subscription:
+            persistPlanBackedSettings()
         case .custom:
             let synthesizerModel: String
             if customSynthesizerModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -405,7 +552,11 @@ struct OnboardingView: View {
             configStore.baseURL = customBaseURL
             configStore.classifierModel = customClassifierModel
             configStore.synthesizerModel = synthesizerModel
-            try? KeychainStore.shared.set(customAPIKey, for: .customLLMAPIKey)
+            do {
+                try KeychainStore.shared.set(customAPIKey, for: .customLLMAPIKey)
+            } catch {
+                logKeychainFailure(error)
+            }
         case .bedrock:
             let synthesizerModelID: String
             if bedrockSynthesizerModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -416,9 +567,13 @@ struct OnboardingView: View {
             configStore.bedrockRegion = bedrockRegion
             configStore.bedrockClassifierModelID = bedrockClassifierModelID
             configStore.bedrockSynthesizerModelID = synthesizerModelID
-            try? KeychainStore.shared.set(bedrockAccessKeyID, for: .bedrockAccessKeyID)
-            try? KeychainStore.shared.set(bedrockSecretAccessKey, for: .bedrockSecretAccessKey)
-            try? KeychainStore.shared.set(bedrockSessionToken, for: .bedrockSessionToken)
+            do {
+                try KeychainStore.shared.set(bedrockAccessKeyID, for: .bedrockAccessKeyID)
+                try KeychainStore.shared.set(bedrockSecretAccessKey, for: .bedrockSecretAccessKey)
+                try KeychainStore.shared.set(bedrockSessionToken, for: .bedrockSessionToken)
+            } catch {
+                logKeychainFailure(error)
+            }
         case .local:
             configStore.ollamaBaseURL = ollamaBaseURL
             configStore.ollamaModel = ollamaModel
@@ -433,18 +588,18 @@ struct OnboardingView: View {
             Text("You're ready").font(.title).bold()
                 .reveal(1, reduceMotion: reduceMotion)
             HStack(spacing: 6) {
-                keyCap("⇧")
-                keyCap("⌘")
-                keyCap("D")
+                KeyCap(key: "⇧", size: 12)
+                KeyCap(key: "⌘", size: 12)
+                KeyCap(key: "D", size: 12)
                 Text("captures a thought from anywhere")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
             }
             .reveal(2, reduceMotion: reduceMotion)
             HStack(spacing: 6) {
-                keyCap("⇧")
-                keyCap("⌘")
-                keyCap("T")
+                KeyCap(key: "⇧", size: 12)
+                KeyCap(key: "⌘", size: 12)
+                KeyCap(key: "T", size: 12)
                 Text("opens your queue, ranked by what's due")
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
@@ -473,14 +628,6 @@ struct OnboardingView: View {
         }
     }
 
-    private func keyCap(_ key: String) -> some View {
-        Text(key)
-            .font(.system(size: 12, weight: .semibold, design: .monospaced))
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: DumpUI.Radius.keyCap))
-    }
 }
 
 /// Staggered entrance for onboarding step content: each indexed element

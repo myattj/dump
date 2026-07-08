@@ -110,28 +110,34 @@ public final class AppCoordinator: ObservableObject {
         startQueueHeartbeat()
     }
 
+    /// Failed registrations (e.g. combo held exclusively by another app),
+    /// keyed by action, from the most recent `registerHotkeys()` pass.
+    public private(set) var failedHotkeyActions: Set<HotkeyManager.Action> = []
+
     private func registerHotkeys() {
         hotkeys.unregisterAll()
+        var failed: Set<HotkeyManager.Action> = []
         if let binding = hotkeyPreferences.binding(for: .capture) {
-            hotkeys.register(.capture, binding: binding) { [weak self] in
+            if !hotkeys.register(.capture, binding: binding, handler: { [weak self] in
                 self?.capture.showQuick()
-            }
+            }) { failed.insert(.capture) }
         }
         if let binding = hotkeyPreferences.binding(for: .query) {
-            hotkeys.register(.query, binding: binding) { [weak self] in
+            if !hotkeys.register(.query, binding: binding, handler: { [weak self] in
                 self?.query.show()
-            }
+            }) { failed.insert(.query) }
         }
         if let binding = hotkeyPreferences.binding(for: .queue) {
-            hotkeys.register(.queue, binding: binding) { [weak self] in
+            if !hotkeys.register(.queue, binding: binding, handler: { [weak self] in
                 self?.queue.show()
-            }
+            }) { failed.insert(.queue) }
         }
         if let binding = hotkeyPreferences.binding(for: .meeting) {
-            hotkeys.register(.meeting, binding: binding) { [weak self] in
+            if !hotkeys.register(.meeting, binding: binding, handler: { [weak self] in
                 self?.capture.showMeeting()
-            }
+            }) { failed.insert(.meeting) }
         }
+        failedHotkeyActions = failed
     }
 
     /// Queue scores are time-relative, so a queue that only recomputes on

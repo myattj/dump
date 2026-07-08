@@ -3,10 +3,12 @@ import Foundation
 public struct SynthesisResult: Equatable, Sendable {
     public let text: String
     public let citations: [Citation]
+    public let label: String
 
-    public init(text: String, citations: [Citation]) {
+    public init(text: String, citations: [Citation], label: String = "Synthesised answer") {
         self.text = text
         self.citations = citations
+        self.label = label
     }
 
     public struct Citation: Equatable, Sendable, Identifiable {
@@ -29,6 +31,32 @@ public struct SynthesisResult: Equatable, Sendable {
 
 public protocol Synthesizing: Sendable {
     func synthesize(query: String, hits: [QueryEngine.Hit]) async throws -> SynthesisResult
+    /// Yields partial answer text as tokens arrive; finishes when generation
+    /// completes. Citations are extracted by the caller from the full text.
+    func synthesizeStream(query: String, hits: [QueryEngine.Hit]) -> AsyncThrowingStream<String, Error>
+}
+
+public extension Synthesizing {
+    /// One-shot fallback wrapping the buffered call, so backends (and test
+    /// fakes) adopt true token streaming incrementally.
+    func synthesizeStream(query: String, hits: [QueryEngine.Hit]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let result = try await synthesize(query: query, hits: hits)
+                    // An empty yield would read as a "first token" upstream
+                    // and animate in an empty answer card.
+                    if !result.text.isEmpty {
+                        continuation.yield(result.text)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 /// Calls Claude Sonnet with the user's question plus the top hits from
@@ -88,6 +116,61 @@ public struct ClaudeSynthesizer: Synthesizing {
         return SynthesisResult(text: text, citations: citations)
     }
 
+    /// True token streaming over the Messages API's SSE mode
+    /// (`content_block_delta` events carry the text).
+    public func synthesizeStream(query: String, hits: [QueryEngine.Hit]) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    guard let key = keychain.string(for: .anthropicAPIKey), !key.isEmpty else {
+                        throw SynthesisError.missingAPIKey
+                    }
+                    let prompt = Self.buildPrompt(query: query, hits: hits)
+                    let payload = MessagesRequest(
+                        model: model,
+                        maxTokens: 800,
+                        system: Self.systemPrompt,
+                        messages: [.init(role: "user", content: prompt)],
+                        stream: true
+                    )
+                    let body = try JSONEncoder.anthropic.encode(payload)
+                    let req = HTTPRequest(
+                        method: "POST",
+                        url: endpointOverride ?? configStore.anthropicMessagesURL(),
+                        headers: [
+                            "x-api-key": key,
+                            "anthropic-version": "2023-06-01",
+                            "content-type": "application/json",
+                            "accept": "text/event-stream",
+                        ],
+                        body: body,
+                        timeout: 60
+                    )
+                    for try await line in transport.streamLines(req) {
+                        guard line.hasPrefix("data:") else { continue }
+                        let json = line.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard let data = json.data(using: .utf8),
+                              let event = try? JSONDecoder.anthropic.decode(StreamEvent.self, from: data) else { continue }
+                        // Anthropic can deliver failures as SSE error events
+                        // on a 200 response — surface, don't truncate silently.
+                        if event.type == "error" {
+                            throw SynthesisError.upstream(200, event.error?.message ?? "stream error")
+                        }
+                        if event.type == "content_block_delta", let text = event.delta?.text, !text.isEmpty {
+                            continuation.yield(text)
+                        }
+                    }
+                    continuation.finish()
+                } catch let HTTPError.status(code, message) {
+                    continuation.finish(throwing: SynthesisError.upstream(code, message))
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     static let systemPrompt = """
     You answer questions using ONLY the provided snippets. Cite sources
     inline as bracketed numbers like [1]. If the snippets don't answer the
@@ -133,7 +216,8 @@ public struct ClaudeSynthesizer: Synthesizing {
         let maxTokens: Int
         let system: String
         let messages: [Msg]
-        enum CodingKeys: String, CodingKey { case model, system, messages; case maxTokens = "max_tokens" }
+        var stream: Bool? = nil
+        enum CodingKeys: String, CodingKey { case model, system, messages, stream; case maxTokens = "max_tokens" }
         struct Msg: Encodable { let role: String; let content: String }
     }
 
@@ -142,6 +226,31 @@ public struct ClaudeSynthesizer: Synthesizing {
         struct Block: Decodable {
             let type: String
             let text: String?
+        }
+    }
+
+    struct StreamEvent: Decodable {
+        let type: String
+        let delta: Delta?
+        let error: ErrorPayload?
+        struct Delta: Decodable {
+            let type: String?
+            let text: String?
+        }
+        struct ErrorPayload: Decodable {
+            let type: String?
+            let message: String?
+        }
+    }
+}
+
+extension ClaudeSynthesizer.SynthesisError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .missingAPIKey:
+            "No Anthropic API key — add one in Settings → Classifier."
+        case let .upstream(status, _):
+            "Claude returned an error (HTTP \(status)). Try again in a moment."
         }
     }
 }

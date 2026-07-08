@@ -5,6 +5,37 @@ import OSLog
 /// a protocol so tests inject a stub instead of touching the network.
 public protocol HTTPTransporting: Sendable {
     func send(_ request: HTTPRequest) async throws -> HTTPResponse
+    /// Response body as it arrives, one line per element (SSE / NDJSON).
+    /// Throws `HTTPError.status` for non-2xx responses.
+    func streamLines(_ request: HTTPRequest) -> AsyncThrowingStream<String, Error>
+}
+
+public extension HTTPTransporting {
+    /// Buffered fallback: one `send()`, then the body replayed line by line.
+    /// Keeps test stubs and simple transports compiling; `HTTPTransport`
+    /// overrides with true incremental delivery.
+    func streamLines(_ request: HTTPRequest) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let response = try await send(request)
+                    guard (200..<300).contains(response.status) else {
+                        throw HTTPError.status(response.status, String(data: response.body, encoding: .utf8) ?? "")
+                    }
+                    let body = String(data: response.body, encoding: .utf8) ?? ""
+                    for rawLine in body.split(separator: "\n", omittingEmptySubsequences: true) {
+                        // CRLF-delimited SSE bodies leave a trailing CR per line.
+                        let line = rawLine.hasSuffix("\r") ? rawLine.dropLast() : rawLine[...]
+                        if !line.isEmpty { continuation.yield(String(line)) }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
 }
 
 public struct HTTPRequest: Sendable {
@@ -122,6 +153,49 @@ public struct HTTPTransport: HTTPTransporting {
         }
     }
 
+    public func streamLines(_ request: HTTPRequest) -> AsyncThrowingStream<String, Error> {
+        let session = self.session
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                let requestID = Self.requestID()
+                let diagnostics = Self.diagnostics(for: request)
+                let startedAt = Date()
+                Self.log.debug("http stream start id=\(requestID, privacy: .public) category=\(diagnostics.category, privacy: .public) method=\(request.method, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public)")
+
+                var req = URLRequest(url: request.url)
+                req.httpMethod = request.method
+                req.httpBody = request.body
+                req.timeoutInterval = request.timeout
+                for (k, v) in request.headers { req.setValue(v, forHTTPHeaderField: k) }
+
+                do {
+                    let (bytes, response) = try await session.bytes(for: req)
+                    guard let http = response as? HTTPURLResponse else {
+                        throw HTTPError.malformedResponse
+                    }
+                    guard (200..<300).contains(http.statusCode) else {
+                        var errorBody = ""
+                        for try await line in bytes.lines {
+                            errorBody += line + "\n"
+                            if errorBody.count > 4096 { break }
+                        }
+                        throw HTTPError.status(http.statusCode, errorBody)
+                    }
+                    for try await line in bytes.lines {
+                        continuation.yield(line)
+                    }
+                    Self.log.info("http stream finish id=\(requestID, privacy: .public) status=\(http.statusCode, privacy: .public) duration_ms=\(Self.durationMS(since: startedAt), privacy: .public)")
+                    continuation.finish()
+                } catch {
+                    let nsError = error as NSError
+                    Self.log.error("http stream failed id=\(requestID, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public) duration_ms=\(Self.durationMS(since: startedAt), privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public) error=\(nsError.localizedDescription, privacy: .public)")
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     private struct RequestDiagnostics {
         let redactedURL: String
         let host: String
@@ -183,6 +257,17 @@ public extension HTTPTransporting {
             return try JSONDecoder().decode(T.self, from: response.body)
         } catch {
             throw HTTPError.decoding(String(describing: error))
+        }
+    }
+}
+
+extension HTTPError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case let .status(code, _): "The server returned an error (HTTP \(code))."
+        case .malformedResponse: "The server returned an unreadable response."
+        case let .decoding(detail): "Couldn't read the server's response. (\(detail))"
+        case .timeout: "The request timed out."
         }
     }
 }

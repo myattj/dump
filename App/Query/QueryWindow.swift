@@ -13,7 +13,6 @@ public final class QueryWindowController {
     private var isShowing = false
     private var hideInFlight = false
     private var deactivateObserver: NSObjectProtocol?
-    private let focusRequest = PanelFocusRequest()
     private let viewModel: QueryViewModel
 
     public init(viewModel: QueryViewModel) {
@@ -70,7 +69,6 @@ public final class QueryWindowController {
         if panel == nil {
             let view = QueryView(
                 viewModel: viewModel,
-                focusRequest: focusRequest,
                 onCancel: { [weak self] in self?.close() },
                 onCommitClose: { [weak self] in self?.close(intent: .committed) }
             )
@@ -82,18 +80,22 @@ public final class QueryWindowController {
             // widen it if they're skimming PDF excerpts.
             let p = DumpWindowChrome.makeFloatingPanel(style: .query, resizable: true)
             p.contentViewController = host
+            // Persist size/position like the queue panel does (QueueWindow saves its
+            // frame to defaults). Frame autosave works for borderless panels — it
+            // keys off windowDidMove/didEndLiveResize — and the non-force restore
+            // applies because the styleMask contains .resizable.
+            p.setFrameAutosaveName("dump.query")
+            if !p.setFrameUsingName("dump.query") {
+                p.center() // first-ever show — nothing saved yet
+            }
             panel = p
         }
         guard let panel else { return }
-        // Only reposition when the panel is actually off-screen — a re-show
-        // that interrupts the hide animation retargets in place instead of
-        // teleporting the still-visible window to center.
-        if !panel.isVisible {
-            panel.center()
-        }
+        // No unconditional center(): a live panel mid-hide keeps its frame; a
+        // recreated one was just restored from the autosave above.
         NSApp.activate(ignoringOtherApps: true)
         PanelAnimator.show(panel)
-        focusRequest.request()
+        PanelInputFocus.focus(in: panel)
     }
 }
 
@@ -140,6 +142,9 @@ public final class QueryViewModel: ObservableObject {
     /// in flight), and a stale synthesis must not animate in over newer
     /// results.
     private var runToken = 0
+    /// The in-flight run, owned so reset() can cancel a stalled stream
+    /// promptly instead of waiting for the next delta to hit the token guard.
+    private var runHandle: Task<Void, Never>?
 
     private var reduceMotion: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -148,6 +153,11 @@ public final class QueryViewModel: ObservableObject {
     public init(engine: QueryEngine, synthesizer: Synthesizing) {
         self.engine = engine
         self.synthesizer = synthesizer
+    }
+
+    public func submitRun() {
+        runHandle?.cancel()
+        runHandle = Task { await self.run() }
     }
 
     public func run() async {
@@ -166,6 +176,19 @@ public final class QueryViewModel: ObservableObject {
         // place instead of strobing results → empty → spinner → results.
         let hadContent = !hits.isEmpty || answer != nil
         do {
+            if let taggedSummary = try await engine.taggedTodoSummary(matching: q) {
+                guard token == runToken else { return }
+                revealCascade = !hadContent && !taggedSummary.hits.isEmpty && !reduceMotion
+                answerRevision += 1
+                withAnimation(resolved(Motion.panel, reduceMotion: reduceMotion)) {
+                    hits = taggedSummary.hits
+                    lastRunQuery = q
+                    answer = taggedSummary.result
+                    selection = .answer
+                }
+                return
+            }
+
             let results = try await engine.search(q, limit: 10)
             guard token == runToken else { return }
             revealCascade = !hadContent && !results.isEmpty && !reduceMotion
@@ -183,26 +206,45 @@ public final class QueryViewModel: ObservableObject {
                     if token == runToken { isSynthesizing = false }
                 }
                 do {
-                    let synthesis = try await synthesizer.synthesize(query: q, hits: results)
+                    // Streamed: the card animates in once, on the first
+                    // token, then grows unanimated (per-token motion on a
+                    // streaming answer is noise). Citations resolve at the
+                    // end, once the bracketed indices are complete.
+                    var text = ""
+                    for try await delta in synthesizer.synthesizeStream(query: q, hits: results) {
+                        guard token == runToken else { return }
+                        text += delta
+                        if answer == nil {
+                            answerRevision += 1
+                            withAnimation(resolved(Motion.panel, reduceMotion: reduceMotion)) {
+                                answer = SynthesisResult(text: text, citations: [])
+                                selection = .answer
+                            }
+                        } else {
+                            answer = SynthesisResult(text: text, citations: [])
+                        }
+                    }
                     guard token == runToken else { return }
-                    answerRevision += 1
-                    withAnimation(resolved(Motion.panel, reduceMotion: reduceMotion)) {
-                        answer = synthesis
-                        selection = .answer
+                    let final = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if answer != nil || !final.isEmpty {
+                        answer = SynthesisResult(
+                            text: final,
+                            citations: ClaudeSynthesizer.extractCitations(from: final, hits: results)
+                        )
                     }
                 } catch {
                     guard token == runToken else { return }
                     // Keep the search results — they're still the answer's
                     // raw material. The view shows an inline failure note.
                     withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
-                        self.error = String(describing: error)
+                        self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                     }
                 }
             }
         } catch {
             guard token == runToken else { return }
             withAnimation(resolved(Motion.snappy, reduceMotion: reduceMotion)) {
-                self.error = String(describing: error)
+                self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 hits = []
                 answer = nil
                 selection = nil
@@ -211,6 +253,14 @@ public final class QueryViewModel: ObservableObject {
     }
 
     public func reset() {
+        // Orphan any in-flight run: every post-await mutation in run() is
+        // guarded on `token == runToken`, so bumping it here keeps a late
+        // synthesis from resurrecting an answer/error into the next open.
+        // Cancel too — a stalled stream would otherwise hold its connection
+        // (and the LLM generation) until the idle timeout.
+        runToken += 1
+        runHandle?.cancel()
+        runHandle = nil
         query = ""
         lastRunQuery = ""
         hits = []
@@ -284,9 +334,11 @@ struct QueryView: View {
     }
 
     @ObservedObject var viewModel: QueryViewModel
-    @ObservedObject var focusRequest: PanelFocusRequest
     let onCancel: @MainActor () -> Void
     let onCommitClose: @MainActor () -> Void
+    // Styling + in-view refocus only (clear button). Focus on open is owned
+    // by the controller via PanelInputFocus — a programmatic FocusState
+    // write on a fresh panel is silently dropped (see PanelInputFocus).
     @FocusState private var focused: Bool
     @State private var selectionSource: SelectionSource = .pointer
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -315,28 +367,18 @@ struct QueryView: View {
     }
 
     var body: some View {
-        DumpPanelShell(style: .query) {
+        DumpPanelShell(style: .query, alignment: .top) {
             VStack(spacing: 0) {
                 titleStrip
                 searchHeader
                 content
                     .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: contentPhase)
             }
-        }
-        .onAppear { requestInputFocus() }
-        .onChange(of: focusRequest.token) { _, _ in
-            requestInputFocus()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .onKeyPress(.escape) {
             onCancel()
             return .handled
-        }
-    }
-
-    private func requestInputFocus() {
-        focused = false
-        Task { @MainActor in
-            focused = true
         }
     }
 
@@ -355,7 +397,7 @@ struct QueryView: View {
             .frame(maxWidth: .infinity)
         }
         .frame(maxWidth: .infinity)
-        .padding(.horizontal, 20)
+        .padding(.horizontal, DumpUI.Spacing.gutter)
         .padding(.bottom, 16)
     }
 
@@ -372,7 +414,7 @@ struct QueryView: View {
                     .foregroundColor(Color.primary.opacity(0.45))
             )
                 .textFieldStyle(.plain)
-                .font(.system(size: 16))
+                .font(DumpUI.Typography.input)
                 .foregroundStyle(.primary)
                 .focused($focused)
                 .onSubmit {
@@ -388,7 +430,7 @@ struct QueryView: View {
                         // Fresh results enter with the full card transition,
                         // not the keyboard crossfade.
                         selectionSource = .pointer
-                        Task { await viewModel.run() }
+                        viewModel.submitRun()
                     }
                 }
                 .onKeyPress(.tab) {
@@ -417,14 +459,15 @@ struct QueryView: View {
                 }
                 .frame(maxWidth: .infinity)
             if !viewModel.query.isEmpty {
-                Button("Clear search", systemImage: "xmark.circle.fill") {
+                Button {
                     viewModel.query = ""
                     focused = true
+                } label: {
+                    Label("Clear search", systemImage: "xmark.circle.fill")
+                        .frame(width: DumpUI.Controls.iconButton.width, height: DumpUI.Controls.iconButton.height)
+                        .contentShape(Rectangle())
                 }
-                .font(.system(size: 14))
-                .foregroundStyle(Color.primary.opacity(0.55))
-                .contentShape(Circle())
-                .labelStyle(.iconOnly)
+                .dumpClearButtonStyle()
                 .buttonStyle(PressableButtonStyle(pressedScale: 0.86))
                 .transition(clearButtonTransition(reduceMotion: reduceMotion))
             }
@@ -435,10 +478,12 @@ struct QueryView: View {
         .liquidGlass(in: Capsule(), interactive: true)
         .overlay(
             Capsule()
-                .stroke(Color.accentColor, lineWidth: 1)
-                .opacity(focused ? 0.45 : 0.12)
+                .stroke(
+                    focused ? DumpUI.SemanticStyle.focusStroke : DumpUI.SemanticStyle.unfocusedStroke,
+                    lineWidth: 1
+                )
         )
-        .scaleEffect(focused ? 1.0 : 0.995, anchor: .center)
+        .scaleEffect(reduceMotion ? 1 : (focused ? 1.0 : 0.995), anchor: .center)
         .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.query.isEmpty)
         .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: focused)
         .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: viewModel.isLoading)
@@ -469,12 +514,14 @@ struct QueryView: View {
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, DumpUI.Spacing.gutter)
             .padding(.bottom, 20)
             .transition(.opacity)
         } else {
             resultsList
-                .padding(.horizontal, 20)
+                .frame(maxWidth: 840)          // cap the reading measure
+                .frame(maxWidth: .infinity)    // center the column in wider panels
+                .padding(.horizontal, DumpUI.Spacing.gutter)
                 .padding(.bottom, 20)
                 .transition(.opacity)
         }
@@ -486,16 +533,20 @@ struct QueryView: View {
     /// to skim a list — so we lead with one, and keep the rest available
     /// without making them load-bearing.
     private var resultsList: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let others = otherItems   // one pass per render; also hoists the O(n²) selectedHit lookups
+        return VStack(alignment: .leading, spacing: 14) {
             if let err = viewModel.error {
                 inlineErrorBanner(err)
                     .transition(reducedTransition(.opacity.combined(with: .offset(y: -4)), reduceMotion: reduceMotion))
             }
 
-            primarySlot
+            ScrollView(.vertical) {
+                primarySlot
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            if !otherItems.isEmpty {
-                othersSection
+            if !others.isEmpty {
+                othersSection(others)
             }
         }
         // Stale results stay visible but dim while a repeat search runs, so
@@ -520,7 +571,7 @@ struct QueryView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .queryQuietSurface(cornerRadius: 10)
+        .dumpQuietSurface(cornerRadius: 10)
     }
 
     @ViewBuilder
@@ -564,7 +615,7 @@ struct QueryView: View {
         )
     }
 
-    private var othersSection: some View {
+    private func othersSection(_ items: [OtherItem]) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Text("Other matches")
@@ -572,12 +623,12 @@ struct QueryView: View {
                     .foregroundStyle(.tertiary)
                     .textCase(.uppercase)
                     .tracking(0.8)
-                Text("\(otherItems.count)")
+                Text("\(items.count)")
                     .font(.system(size: 10, weight: .semibold, design: .rounded))
                     .foregroundStyle(.tertiary)
                     .monospacedDigit()
-                    .contentTransition(reduceMotion ? .opacity : .numericText(value: Double(otherItems.count)))
-                    .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: otherItems.count)
+                    .contentTransition(reduceMotion ? .opacity : .numericText(value: Double(items.count)))
+                    .animation(resolved(Motion.snappy, reduceMotion: reduceMotion), value: items.count)
                 if viewModel.isSynthesizing {
                     SynthesizingChip()
                         .transition(reducedTransition(
@@ -588,14 +639,14 @@ struct QueryView: View {
                 Spacer()
                 Text("↑↓ to switch")
                     .font(.system(size: 10, weight: .medium, design: .rounded))
-                    .foregroundStyle(.quaternary)
+                    .foregroundStyle(.tertiary)
             }
             .padding(.horizontal, 4)
 
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 2) {
-                        ForEach(Array(otherItems.enumerated()), id: \.element.id) { index, item in
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                             OtherMatchRow(
                                 item: item,
                                 onSelect: {
@@ -622,7 +673,7 @@ struct QueryView: View {
                     _ = proxy
                 }
             }
-            .frame(maxHeight: 180)
+            .frame(minHeight: 120, maxHeight: .infinity, alignment: .top)
         }
     }
 
@@ -704,13 +755,16 @@ struct QueryView: View {
         VStack(spacing: 14) {
             Spacer()
             Image(systemName: viewModel.mode == .ask ? "sparkles" : "magnifyingglass")
-                .font(.system(size: 42, weight: .light))
+                .font(DumpUI.Typography.emptyStateIcon)
                 .foregroundStyle(.tertiary)
                 .symbolRenderingMode(.hierarchical)
-                .contentTransition(.symbolEffect(.replace))
-                .symbolEffect(.pulse.byLayer, options: .repeating, isActive: viewModel.mode == .ask && !reduceMotion)
-            Text(viewModel.mode == .ask ? "Ask anything about your archive" : "Search your archive")
-                .font(.system(size: 17, weight: .medium))
+                .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
+                // Repeating idle pulse removed — if a mode cue is wanted, use the app's one-shot idiom:
+                // .symbolEffect(.bounce.up, value: viewModel.mode)
+            Text(viewModel.lastRunQuery.isEmpty
+                ? (viewModel.mode == .ask ? "Ask anything about your archive" : "Search your archive")
+                : "No matches for \u{201C}\(viewModel.lastRunQuery)\u{201D}")
+                .font(DumpUI.Typography.emptyStateTitle)
                 .foregroundStyle(.secondary)
                 .contentTransition(.opacity)
                 .id(viewModel.mode)
@@ -729,11 +783,7 @@ struct QueryView: View {
 
     private func shortcut(_ key: String, _ description: String) -> some View {
         HStack(spacing: 6) {
-            Text(key)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 4))
+            KeyCap(key: key)
             Text(description)
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
@@ -751,7 +801,7 @@ struct QueryView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 14)
-        .queryQuietSurface(cornerRadius: 10)
+        .dumpQuietSurface(cornerRadius: 10)
     }
 
     private func errorRow(_ message: String) -> some View {
@@ -773,7 +823,7 @@ struct QueryView: View {
             Spacer()
         }
         .padding(14)
-        .queryQuietSurface(cornerRadius: 10)
+        .dumpQuietSurface(cornerRadius: 10)
     }
 }
 
@@ -818,16 +868,18 @@ struct PrimaryHitCard: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        let bodyText = HitDisplay.body(for: hit)   // one cleanedContent pass per render
         VStack(alignment: .leading, spacing: 14) {
             header
-            if hasBody {
-                bodyBlock
+            if !bodyText.isEmpty {
+                bodyBlock(bodyText)
             }
             footer
         }
+        .textSelection(.enabled) // selection is contiguous per Text (title and body select separately) — fine here
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .queryQuietSurface(cornerRadius: 14)
+        .dumpQuietSurface(cornerRadius: 14)
     }
 
     private var header: some View {
@@ -869,20 +921,10 @@ struct PrimaryHitCard: View {
     }
 
     private func chip(icon: String, label: String, color: Color) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 9, weight: .semibold))
-            Text(label)
-                .font(.system(size: 10.5, weight: .semibold))
-                .tracking(0.3)
-        }
-        .foregroundStyle(color)
-        .padding(.horizontal, 7)
-        .padding(.vertical, 2.5)
-        .background(color.opacity(0.14), in: Capsule())
+        ChipLabel(icon: icon, text: label, color: color)
     }
 
-    private var bodyBlock: some View {
+    private func bodyBlock(_ bodyText: String) -> some View {
         HighlightedText(
             text: bodyText,
             query: query,
@@ -916,7 +958,9 @@ struct PrimaryHitCard: View {
             .foregroundStyle(.tertiary)
             Spacer(minLength: 4)
             QuickAction(icon: "doc.on.clipboard", label: "Copy", action: copyExcerpt)
+                .keyboardShortcut("c", modifiers: [.command, .shift])
             QuickAction(icon: "folder.fill", label: "Reveal", action: reveal)
+                .keyboardShortcut("r", modifiers: [.command, .shift])
             QuickAction(icon: "arrow.up.forward.app.fill", label: "Open", action: onOpen, prominent: true)
         }
     }
@@ -971,6 +1015,7 @@ struct PrimaryAnswerCard: View {
                 .foregroundStyle(.primary)
                 .fixedSize(horizontal: false, vertical: true)
                 .lineSpacing(5)
+                .textSelection(.enabled) // native range selection; Cmd+C works via the responder chain
             if !answer.citations.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 5) {
@@ -989,10 +1034,19 @@ struct PrimaryAnswerCard: View {
                     }
                 }
             }
+            HStack(spacing: 8) {
+                Spacer(minLength: 4)
+                QuickAction(icon: "doc.on.clipboard", label: "Copy", action: copyAnswer)
+            }
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .queryQuietSurface(cornerRadius: 14)
+        .dumpQuietSurface(cornerRadius: 14)
+    }
+
+    private func copyAnswer() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(answer.text, forType: .string)
     }
 
     private var header: some View {
@@ -1009,7 +1063,7 @@ struct PrimaryAnswerCard: View {
                 HStack(spacing: 4) {
                     Image(systemName: "sparkle")
                         .font(.system(size: 9, weight: .semibold))
-                    Text("Synthesised answer")
+                    Text(answer.label)
                         .font(.system(size: 10.5, weight: .semibold))
                         .tracking(0.3)
                 }
@@ -1072,7 +1126,7 @@ struct ModeToggle: View {
                 .frame(maxWidth: .infinity)
                 .contentShape(Capsule())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableButtonStyle(pressedScale: 0.97))
         .background {
             if mode == m {
                 thumb
@@ -1085,7 +1139,7 @@ struct ModeToggle: View {
     private var thumb: some View {
         let capsule = Capsule()
             .fill(.thinMaterial)
-            .overlay(Capsule().strokeBorder(Color.white.opacity(0.08), lineWidth: 0.5))
+            .overlay(Capsule().strokeBorder(DumpUI.SemanticStyle.hairline, lineWidth: 0.5))
             .shadow(color: .black.opacity(0.10), radius: 2, y: 1)
 
         if reduceMotion {
@@ -1295,7 +1349,6 @@ struct QuickAction: View {
     var prominent: Bool = false
 
     @State private var hovering = false
-    @State private var pressed = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -1382,7 +1435,7 @@ struct CitationChip: View {
             )
         }
         .buttonStyle(PressableButtonStyle(pressedScale: 0.94))
-        .scaleEffect(hovering ? 1.06 : 1, anchor: .center)
+        .scaleEffect(reduceMotion ? 1 : (hovering ? 1.06 : 1), anchor: .center)
         .onHover { hovering = $0 }
         .animation(resolved(Motion.interactive, reduceMotion: reduceMotion), value: hovering)
     }
@@ -1391,14 +1444,6 @@ struct CitationChip: View {
 // MARK: - Query content surfaces
 
 private enum QuerySurface {
-    static var contentFill: Color {
-        Color(nsColor: .textBackgroundColor).opacity(0.92)
-    }
-
-    static var contentStroke: Color {
-        Color(nsColor: .separatorColor).opacity(0.65)
-    }
-
     static var contentRail: Color {
         Color(nsColor: .separatorColor).opacity(0.95)
     }
@@ -1417,77 +1462,6 @@ private enum QuerySurface {
 
     static func controlFill(hovering: Bool) -> Color {
         Color(nsColor: .controlBackgroundColor).opacity(hovering ? 0.90 : 0.72)
-    }
-}
-
-private struct QueryQuietSurface: ViewModifier {
-    let cornerRadius: CGFloat
-
-    func body(content: Content) -> some View {
-        let shape = RoundedRectangle(cornerRadius: cornerRadius)
-
-        content
-            .background(shape.fill(QuerySurface.contentFill))
-            .overlay(shape.strokeBorder(QuerySurface.contentStroke, lineWidth: 0.5))
-    }
-}
-
-private extension View {
-    func queryQuietSurface(cornerRadius: CGFloat) -> some View {
-        modifier(QueryQuietSurface(cornerRadius: cornerRadius))
-    }
-}
-
-// MARK: - Flow layout for citation chips
-
-struct FlowLayout: Layout {
-    var spacing: CGFloat = 6
-
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let width = proposal.width ?? .infinity
-        let rows = computeRows(subviews: subviews, maxWidth: width)
-        let height = rows.reduce(0) { $0 + $1.height } + CGFloat(max(0, rows.count - 1)) * spacing
-        return CGSize(width: width.isFinite ? width : rows.map { $0.width }.max() ?? 0, height: height)
-    }
-
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
-        let rows = computeRows(subviews: subviews, maxWidth: bounds.width)
-        var y = bounds.minY
-        for row in rows {
-            var x = bounds.minX
-            for entry in row.entries {
-                let size = entry.size
-                subviews[entry.index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
-                x += size.width + spacing
-            }
-            y += row.height + spacing
-        }
-    }
-
-    private func computeRows(subviews: Subviews, maxWidth: CGFloat) -> [Row] {
-        var rows: [Row] = []
-        var current = Row()
-        for (i, sub) in subviews.enumerated() {
-            let size = sub.sizeThatFits(.unspecified)
-            let prospectiveWidth = current.width + (current.entries.isEmpty ? 0 : spacing) + size.width
-            if prospectiveWidth > maxWidth, !current.entries.isEmpty {
-                rows.append(current)
-                current = Row()
-            }
-            if !current.entries.isEmpty { current.width += spacing }
-            current.entries.append(.init(index: i, size: size))
-            current.width += size.width
-            current.height = max(current.height, size.height)
-        }
-        if !current.entries.isEmpty { rows.append(current) }
-        return rows
-    }
-
-    struct Row {
-        struct Entry { let index: Int; let size: CGSize }
-        var entries: [Entry] = []
-        var width: CGFloat = 0
-        var height: CGFloat = 0
     }
 }
 
@@ -1544,44 +1518,57 @@ enum HitDisplay {
     /// Verbose date string for the preview pane header. Switches between
     /// relative ("Today", "Yesterday"), weekday for the past week, and a
     /// month-day-year for older entries.
+    /// Cached per-pattern formatters, mirroring the `timestampParser` precedent
+    /// below. `static let` is lazy and thread-safe; DateFormatter is
+    /// thread-safe for formatting (mutation is what isn't).
+    private static let displayFormatters: [String: DateFormatter] = {
+        var cache: [String: DateFormatter] = [:]
+        for pattern in ["'Today at' h:mm a", "'Yesterday at' h:mm a", "EEEE 'at' h:mm a",
+                        "MMM d 'at' h:mm a", "MMM d, yyyy", "h:mm a", "EEE", "MMM d"] {
+            let f = DateFormatter()
+            f.locale = .current
+            f.dateFormat = pattern
+            cache[pattern] = f
+        }
+        return cache
+    }()
+
     static func format(date: Date, now: Date = Date()) -> String {
         let calendar = Calendar.current
-        let formatter = DateFormatter()
-        formatter.locale = .current
+        let pattern: String
         if calendar.isDateInToday(date) {
-            formatter.dateFormat = "'Today at' h:mm a"
+            pattern = "'Today at' h:mm a"
         } else if calendar.isDateInYesterday(date) {
-            formatter.dateFormat = "'Yesterday at' h:mm a"
+            pattern = "'Yesterday at' h:mm a"
         } else if let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)).day,
                   days > 0, days < 7 {
-            formatter.dateFormat = "EEEE 'at' h:mm a"
+            pattern = "EEEE 'at' h:mm a"
         } else if calendar.component(.year, from: date) == calendar.component(.year, from: now) {
-            formatter.dateFormat = "MMM d 'at' h:mm a"
+            pattern = "MMM d 'at' h:mm a"
         } else {
-            formatter.dateFormat = "MMM d, yyyy"
+            pattern = "MMM d, yyyy"
         }
-        return formatter.string(from: date)
+        return displayFormatters[pattern]!.string(from: date)
     }
 
     /// Tight time string for the rail rows where space is precious.
     /// "6:19 PM" today, "Mon" within the past week, "May 18" beyond that.
     static func shortRelative(date: Date, now: Date = Date()) -> String {
         let calendar = Calendar.current
-        let formatter = DateFormatter()
-        formatter.locale = .current
+        let pattern: String
         if calendar.isDateInToday(date) {
-            formatter.dateFormat = "h:mm a"
+            pattern = "h:mm a"
         } else if calendar.isDateInYesterday(date) {
             return "Yesterday"
         } else if let days = calendar.dateComponents([.day], from: calendar.startOfDay(for: date), to: calendar.startOfDay(for: now)).day,
                   days > 0, days < 7 {
-            formatter.dateFormat = "EEE"
+            pattern = "EEE"
         } else if calendar.component(.year, from: date) == calendar.component(.year, from: now) {
-            formatter.dateFormat = "MMM d"
+            pattern = "MMM d"
         } else {
-            formatter.dateFormat = "MMM d, yyyy"
+            pattern = "MMM d, yyyy"
         }
-        return formatter.string(from: date)
+        return displayFormatters[pattern]!.string(from: date)
     }
 
     /// Body content for a hit: cleaned snippet minus any line that just

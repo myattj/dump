@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 @main
 struct DumpApp: App {
@@ -28,7 +29,8 @@ struct DumpApp: App {
 /// visible without opening anything.
 struct MenuBarIcon: View {
     @ObservedObject var capture: CaptureCoordinator
-    @ObservedObject var queueVM: QueueViewModel
+    let queueVM: QueueViewModel
+    @State private var overdueCount = 0
     @State private var showConfirmation = false
     @State private var revertTask: Task<Void, Never>?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -46,8 +48,10 @@ struct MenuBarIcon: View {
                     icon.symbolEffect(.bounce.up, value: capture.captureTick)
                 }
             }
-            if queueVM.summary.overdueCount > 0 {
-                Text("\(queueVM.summary.overdueCount)")
+            .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
+            .animation(Motion.snappy, value: showConfirmation)
+            if overdueCount > 0 {
+                Text("\(overdueCount)")
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .monospacedDigit()
             }
@@ -62,11 +66,11 @@ struct MenuBarIcon: View {
                 showConfirmation = false
             }
         }
+        .onReceive(queueVM.$summary.map(\.overdueCount).removeDuplicates()) { overdueCount = $0 }
     }
 
     private var accessibilityLabel: String {
-        let overdue = queueVM.summary.overdueCount
-        return overdue > 0 ? "Dump, \(overdue) overdue" : "Dump"
+        overdueCount > 0 ? "Dump, \(overdueCount) overdue" : "Dump"
     }
 }
 
@@ -170,6 +174,9 @@ struct DumpMenu: View {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.pdf]
         panel.canChooseDirectories = false
+        // LSUIElement app: menu clicks don't activate us, so the modal panel would lack
+        // key status. Same idiom as SettingsWindowController.show().
+        NSApp.activate(ignoringOtherApps: true)
         if panel.runModal() == .OK, let url = panel.url {
             Task { await coordinator.capture.importPDF(at: url) }
         }

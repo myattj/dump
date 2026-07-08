@@ -48,7 +48,7 @@ public final class NotificationRouter: NSObject, UNUserNotificationCenterDelegat
         // A firing notification means an item just crossed its date — a
         // pinned queue panel showing it as future-dated is now lying.
         await refreshQueue()
-        return [.banner, .sound]
+        return [.banner, .list, .sound]
     }
 
     public nonisolated func userNotificationCenter(
