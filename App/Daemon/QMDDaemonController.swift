@@ -85,6 +85,7 @@ public actor QMDDaemonController {
     }
 
     public func start() async {
+        guard !Task.isCancelled else { return }
         launchGeneration &+= 1
         let generation = launchGeneration
         state = .starting
@@ -98,6 +99,7 @@ public actor QMDDaemonController {
             "QMD_DATA_DIR": storage.root.path,
         ]
         do {
+            try Task.checkCancellation()
             try process.launch(
                 executable: nodeURL(),
                 arguments: [qmdEntryURL().path, "mcp", "--http", "--port", String(chosen)],
@@ -110,13 +112,22 @@ public actor QMDDaemonController {
                 }
             )
             try await waitForHealth(port: chosen)
+            try Task.checkCancellation()
+            guard generation == launchGeneration else { return }
             state = .running(port: chosen)
             restartAttempts = 0
             log.info("qmd up on \(chosen, privacy: .public)")
             DiagnosticLog.event(.info, category: "qmd", "daemon healthy", metadata: [
                 "port": String(chosen),
             ])
+        } catch is CancellationError {
+            guard generation == launchGeneration else { return }
+            launchGeneration &+= 1
+            process.terminate()
+            state = .stopped
+            port = nil
         } catch {
+            guard generation == launchGeneration else { return }
             launchGeneration &+= 1
             process.terminate()
             state = .crashed(reason: String(describing: error))
@@ -153,13 +164,16 @@ public actor QMDDaemonController {
         let deadline = ContinuousClock.now + config.startupGracePeriod
         let url = URL(string: "http://localhost:\(port)\(config.healthPath)")!
         while ContinuousClock.now < deadline {
+            try Task.checkCancellation()
             do {
                 let resp = try await transport.send(HTTPRequest(method: "GET", url: url, timeout: 2))
                 if resp.status == 200 { return }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 // ignore until grace period elapses
             }
-            try? await Task.sleep(for: .milliseconds(250))
+            try await Task.sleep(for: .milliseconds(250))
         }
         throw HealthError.timedOut
     }

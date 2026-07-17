@@ -420,8 +420,7 @@ struct ClassifierSettingsView: View {
                     Text("Used for both classification and Ask mode. The model must already be available in Ollama.")
                         .font(.caption).foregroundStyle(.secondary)
                     Button("Save Ollama settings") {
-                        configStore.ollamaBaseURL = ollamaBaseURL
-                        configStore.ollamaModel = ollamaModel
+                        configStore.saveOllama(baseURL: ollamaBaseURL, model: ollamaModel)
                         flash("Saved")
                     }
                 }

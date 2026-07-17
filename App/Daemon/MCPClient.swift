@@ -61,35 +61,13 @@ public actor MCPClient: QMDClienting {
         let node = await daemon.nodeExecutableURL()
         let script = await daemon.qmdCLIScriptURL()
         let env = await daemon.cliEnvironment()
-
-        return try await Task.detached(priority: .userInitiated) {
-            let process = Process()
-            process.executableURL = node
-            process.arguments = [script.path] + arguments
-            var fullEnv = ProcessInfo.processInfo.environment
-            for (k, v) in env { fullEnv[k] = v }
-            process.environment = fullEnv
-
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-            let stdout = ProcessPipeCollector(pipe: outPipe)
-            let stderr = ProcessPipeCollector(pipe: errPipe)
-
-            try process.run()
-            process.waitUntilExit()
-
-            let output = QMDCLIOutput(
-                exitCode: process.terminationStatus,
-                stdout: String(data: stdout.finish(), encoding: .utf8) ?? "",
-                stderr: String(data: stderr.finish(), encoding: .utf8) ?? ""
-            )
-            if output.exitCode != 0 {
-                throw QMDClientError.cliFailed(exitCode: output.exitCode, stderr: output.stderr)
-            }
-            return output
-        }.value
+        var fullEnv = ProcessInfo.processInfo.environment
+        for (key, value) in env { fullEnv[key] = value }
+        return try await QMDCLIProcessRunner(
+            executable: node,
+            arguments: [script.path] + arguments,
+            environment: fullEnv
+        ).run()
     }
 
     // MARK: - MCP plumbing
@@ -248,6 +226,111 @@ public actor MCPClient: QMDClienting {
 
     private struct QueryResult: Decodable {
         let results: [QMDHit]
+    }
+}
+
+/// Runs one qmd CLI process and terminates that exact child when its parent
+/// task is cancelled (notably while app startup is being stopped on Quit).
+final class QMDCLIProcessRunner: @unchecked Sendable {
+    private let executable: URL
+    private let arguments: [String]
+    private let environment: [String: String]
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    init(executable: URL, arguments: [String], environment: [String: String]) {
+        self.executable = executable
+        self.arguments = arguments
+        self.environment = environment
+    }
+
+    func run() async throws -> QMDCLIOutput {
+        let output = try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await Task.detached(priority: .userInitiated) {
+                try self.runSynchronously()
+            }.value
+        } onCancel: {
+            self.cancel()
+        }
+        try Task.checkCancellation()
+        return output
+    }
+
+    func runningProcessIdentifier() -> pid_t? {
+        lock.withLock {
+            guard let process, process.isRunning else { return nil }
+            return process.processIdentifier
+        }
+    }
+
+    private func runSynchronously() throws -> QMDCLIOutput {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.environment = environment
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        let stdout = ProcessPipeCollector(pipe: outPipe)
+        let stderr = ProcessPipeCollector(pipe: errPipe)
+
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            throw CancellationError()
+        }
+        self.process = process
+        do {
+            try process.run()
+        } catch {
+            self.process = nil
+            lock.unlock()
+            throw error
+        }
+        lock.unlock()
+
+        process.waitUntilExit()
+        let output = QMDCLIOutput(
+            exitCode: process.terminationStatus,
+            stdout: String(data: stdout.finish(), encoding: .utf8) ?? "",
+            stderr: String(data: stderr.finish(), encoding: .utf8) ?? ""
+        )
+        let wasCancelled = lock.withLock {
+            if self.process === process { self.process = nil }
+            return cancelled
+        }
+        if wasCancelled { throw CancellationError() }
+        if output.exitCode != 0 {
+            throw QMDClientError.cliFailed(exitCode: output.exitCode, stderr: output.stderr)
+        }
+        return output
+    }
+
+    private func cancel() {
+        let process = lock.withLock { () -> Process? in
+            cancelled = true
+            return self.process
+        }
+        guard let process, process.isRunning else { return }
+        let pid = process.processIdentifier
+        process.terminate()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.forceTerminateIfRunning(pid: pid)
+        }
+    }
+
+    private func forceTerminateIfRunning(pid: pid_t) {
+        let ownedProcess = lock.withLock { () -> Process? in
+            guard let process, process.processIdentifier == pid else { return nil }
+            return process
+        }
+        if let ownedProcess, ownedProcess.isRunning {
+            Darwin.kill(pid, SIGKILL)
+        }
     }
 }
 

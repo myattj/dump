@@ -2,6 +2,20 @@ import SwiftUI
 import AppKit
 import Combine
 
+/// DumpTests is hosted inside the real app binary. Keep that host from
+/// starting production services such as the bundled qmd daemon.
+enum AppRuntimeEnvironment {
+    static let unitTestingKey = "DUMP_UNIT_TESTING"
+
+    static func isUnitTestProcess(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        environment[unitTestingKey] == "1"
+            || environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+    }
+}
+
 @main
 struct DumpApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
@@ -80,27 +94,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let settingsController: SettingsWindowController
     let onboardingController: OnboardingWindowController
     let notificationRouter: NotificationRouter
+    private let shouldStartServices: Bool
+    private var terminationTask: Task<Void, Never>?
+    private var terminationCleanupCompleted = false
 
     override init() {
+        let shouldStartServices = !AppRuntimeEnvironment.isUnitTestProcess()
         let c = AppCoordinator()
         self.coordinator = c
         self.settingsController = SettingsWindowController(coordinator: c)
         self.onboardingController = OnboardingWindowController(coordinator: c)
         self.notificationRouter = NotificationRouter(coordinator: c)
+        self.shouldStartServices = shouldStartServices
         super.init()
         // Installed here rather than in didFinishLaunching: the delegate
         // must be in place before launch completes to receive the response
         // that launched the app.
-        notificationRouter.install()
+        if shouldStartServices {
+            notificationRouter.install()
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard shouldStartServices else { return }
         coordinator.start()
         onboardingController.showIfNeeded()
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        coordinator.stop()
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if terminationCleanupCompleted { return .terminateNow }
+        if terminationTask != nil { return .terminateLater }
+
+        terminationTask = Task { @MainActor in
+            await coordinator.stop()
+            terminationCleanupCompleted = true
+            terminationTask = nil
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 }
 

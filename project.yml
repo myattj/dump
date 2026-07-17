@@ -133,6 +133,8 @@ schemes:
       targets:
         - DumpTests
       gatherCoverageData: true
+      environmentVariables:
+        DUMP_UNIT_TESTING: "1"
     run:
       config: Debug
     archive:

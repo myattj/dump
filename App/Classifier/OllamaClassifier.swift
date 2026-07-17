@@ -1,28 +1,34 @@
 import Foundation
 
-/// Hits a locally-running Ollama instance at 127.0.0.1:11434. Asks the
-/// model to emit JSON conforming to the classifier schema and parses what
-/// comes back. The JSON-mode prompt is deliberately strict.
+/// Asks the configured Ollama model to emit JSON conforming to the classifier
+/// schema and parses what comes back. Configuration is read per request so a
+/// Settings save applies without rebuilding the app's long-lived hub.
 public struct OllamaClassifier: Classifier {
-    public let identifier: String
+    public var identifier: String {
+        "ollama:\(modelOverride ?? configStore.ollamaConfiguration().model)"
+    }
+
     private let transport: HTTPTransporting
-    private let endpoint: URL
-    private let model: String
+    private let configStore: CustomLLMConfigStore
+    private let endpointOverride: URL?
+    private let modelOverride: String?
 
     public init(
         transport: HTTPTransporting = HTTPTransport(),
-        endpoint: URL = CustomLLMConfigStore.shared.ollamaChatURL(),
-        model: String = CustomLLMConfigStore.shared.ollamaModel
+        configStore: CustomLLMConfigStore = .shared,
+        endpoint: URL? = nil,
+        model: String? = nil
     ) {
         self.transport = transport
-        self.endpoint = endpoint
-        self.model = model
-        self.identifier = "ollama:\(model)"
+        self.configStore = configStore
+        self.endpointOverride = endpoint
+        self.modelOverride = model
     }
 
     public func classify(_ text: String, now: Date) async throws -> ClassifierResult {
+        let configuration = configuration()
         let payload = ChatRequest(
-            model: model,
+            model: configuration.model,
             messages: [
                 .init(role: "system", content: Self.systemPrompt(now: now)),
                 .init(role: "user", content: text),
@@ -34,7 +40,7 @@ public struct OllamaClassifier: Classifier {
         let body = try JSONEncoder().encode(payload)
         let req = HTTPRequest(
             method: "POST",
-            url: endpoint,
+            url: configuration.endpoint,
             headers: ["Content-Type": "application/json"],
             body: body,
             timeout: 60
@@ -58,6 +64,14 @@ public struct OllamaClassifier: Classifier {
             effortMinutes: parsed.effort_minutes,
             importance: ClassifierResult.normalizedImportance(parsed.importance),
             metadataConfidence: parsed.metadata_confidence
+        )
+    }
+
+    private func configuration() -> OllamaConfiguration {
+        let stored = configStore.ollamaConfiguration()
+        return OllamaConfiguration(
+            endpoint: endpointOverride ?? stored.endpoint,
+            model: modelOverride ?? stored.model
         )
     }
 
