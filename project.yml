@@ -12,8 +12,8 @@ settings:
   base:
     SWIFT_VERSION: "6.0"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
-    MARKETING_VERSION: "0.1.2"
-    CURRENT_PROJECT_VERSION: "5"
+    MARKETING_VERSION: "0.1.3"
+    CURRENT_PROJECT_VERSION: "6"
     ENABLE_HARDENED_RUNTIME: YES
     CODE_SIGN_STYLE: Automatic
     DEAD_CODE_STRIPPING: YES
@@ -53,8 +53,12 @@ targets:
           "${SRCROOT}/Scripts/fetch-runtime.sh"
         inputFiles:
           - $(SRCROOT)/Scripts/fetch-runtime.sh
+          - $(SRCROOT)/Runtime/qmd/package.json
+          - $(SRCROOT)/Runtime/qmd/package-lock.json
         outputFiles:
+          - $(SRCROOT)/Runtime/qmd/node_modules/.runtime-ready
           - $(SRCROOT)/Runtime/node/bin/node
+          - $(SRCROOT)/Runtime/qmd/node_modules/@tobilu/qmd/dist/cli/qmd.js
         basedOnDependencyAnalysis: true
       - name: Copy Runtime into app bundle
         script: |
@@ -67,8 +71,9 @@ targets:
                 --exclude ".npm" \
                 "${SRCROOT}/Runtime/" "$DEST/"
         inputFiles:
-          - $(SRCROOT)/Runtime/node/bin/node
+          - $(SRCROOT)/Runtime/qmd/node_modules/.runtime-ready
         outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/runtime/qmd/node_modules/.runtime-ready
           - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/runtime/node/bin/node
         basedOnDependencyAnalysis: true
     dependencies:
@@ -85,7 +90,7 @@ targets:
         LSUIElement: true
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
         CADisableMinimumFrameDuration: true
-        NSHumanReadableCopyright: Copyright © 2026 Joshua Myatt. All rights reserved.
+        NSHumanReadableCopyright: Copyright © 2026 Joshua Myatt
         LSApplicationCategoryType: public.app-category.productivity
         SUFeedURL: https://myattj.github.io/dump-updates/appcast.xml
         SUEnableInstallerLauncherService: true

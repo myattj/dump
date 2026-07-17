@@ -10,7 +10,7 @@ set -euo pipefail
 # Optional env:
 #   ENTITLEMENTS         defaults to Resources/Dump.entitlements
 #   NODE_ENTITLEMENTS    defaults to Resources/Node.entitlements
-#   KEYCHAIN_PROFILE     if your signing identity lives in a custom keychain
+#   KEYCHAIN_PROFILE     path to a custom keychain containing the identity
 
 : "${DEVELOPER_ID:?DEVELOPER_ID must be set (e.g. 'Developer ID Application: Josh Myatt (TEAMID)')}"
 : "${APP_PATH:?APP_PATH must point to the built Dump.app}"
@@ -19,6 +19,16 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENTITLEMENTS="${ENTITLEMENTS:-$ROOT_DIR/Resources/Dump.entitlements}"
 NODE_ENTITLEMENTS="${NODE_ENTITLEMENTS:-$ROOT_DIR/Resources/Node.entitlements}"
 RUNTIME_INSIDE_APP="$APP_PATH/Contents/Resources/runtime"
+KEYCHAIN_PROFILE="${KEYCHAIN_PROFILE:-}"
+
+CODESIGN_KEYCHAIN_ARGS=()
+if [[ -n "$KEYCHAIN_PROFILE" ]]; then
+  [[ -f "$KEYCHAIN_PROFILE" ]] || {
+    echo "sign.sh: keychain not found at $KEYCHAIN_PROFILE" >&2
+    exit 1
+  }
+  CODESIGN_KEYCHAIN_ARGS=(--keychain "$KEYCHAIN_PROFILE")
+fi
 
 if [[ ! -d "$APP_PATH" ]]; then
   echo "sign.sh: $APP_PATH not found" >&2
@@ -36,6 +46,7 @@ codesign_one() {
   shift || true
   codesign --force \
            --sign "$DEVELOPER_ID" \
+           "${CODESIGN_KEYCHAIN_ARGS[@]}" \
            --options runtime \
            --timestamp \
            "$@" \
@@ -66,6 +77,7 @@ log "signing Dump.app with entitlements"
 codesign --force \
          --deep \
          --sign "$DEVELOPER_ID" \
+         "${CODESIGN_KEYCHAIN_ARGS[@]}" \
          --options runtime \
          --timestamp \
          --entitlements "$ENTITLEMENTS" \

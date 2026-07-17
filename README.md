@@ -3,15 +3,15 @@
 Capture thoughts in a keystroke. Keep them as Markdown. Find them when they matter.
 
 [![CI](https://github.com/myattj/dump/actions/workflows/ci.yml/badge.svg)](https://github.com/myattj/dump/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/myattj/dump-updates?label=download&sort=semver)](https://github.com/myattj/dump-updates/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/myattj/dump?label=download&sort=semver)](https://github.com/myattj/dump/releases/latest)
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-000000?logo=apple)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-arm64-000000?logo=apple)
 ![Swift 6](https://img.shields.io/badge/Swift-6.0-F05138?logo=swift&logoColor=white)
-[![License](https://img.shields.io/badge/license-all_rights_reserved-lightgrey.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Dump is a native macOS menu bar app for quickly capturing notes, tasks, reminders, ideas, and references. It writes your captures to ordinary Markdown files, builds a local search index with [qmd](https://github.com/tobi/qmd), and gives you a ranked queue for deciding what to do next.
 
-The source is public for transparency and issue-based feedback, but it is **not open source**. See [LICENSE](LICENSE).
+Dump is open source under the [MIT License](LICENSE).
 
 ## What Dump does
 
@@ -37,9 +37,13 @@ Model requirements depend on the provider you choose during onboarding. Ollama a
 
 ## Download and install
 
-1. Download the latest DMG from [Dump Releases](https://github.com/myattj/dump-updates/releases/latest).
+**[Download the latest DMG](https://github.com/myattj/dump/releases/latest)**
+
+Official release DMGs are signed with Developer ID and notarized by Apple.
+
+1. Download the DMG from the latest release.
 2. Open the DMG and drag Dump into Applications.
-3. Launch Dump. It appears in the menu bar rather than the Dock.
+3. Open Dump from Applications. It appears in the menu bar rather than the Dock.
 4. Complete onboarding and choose a classifier and answer provider.
 
 Dump uses Sparkle for update checks. Automatic checks can be changed in Settings.
@@ -100,27 +104,31 @@ Read [PRIVACY.md](PRIVACY.md) before using Dump with sensitive notes or third-pa
 
 ### Prerequisites
 
-- An Apple-silicon Mac
-- Xcode 16 or newer, with Swift 6 support
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen)
+- An Apple-silicon Mac running macOS 14 or later
+- The full Xcode 16 app or newer, with Swift 6 support
+- [Homebrew](https://brew.sh/) for installing [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 - Network access for Swift packages, Node.js, qmd, and qmd model assets
 
-### Build and test
+### Build and open Dump
 
 ```bash
-brew install xcodegen
 git clone https://github.com/myattj/dump.git
 cd dump
-
-xcodegen generate
-./Scripts/fetch-runtime.sh
-
-xcodebuild \
-  -project Dump.xcodeproj \
-  -scheme Dump \
-  -destination 'platform=macOS,arch=arm64' \
-  test
+brew install xcodegen
+./Scripts/build-local.sh --open
 ```
+
+The script generates the Xcode project, downloads the pinned runtime dependencies, and builds Dump at `build/local/Dump.app`. The first build requires network access and may take longer while those dependencies are downloaded.
+
+Local builds are ad-hoc signed for development. They are not official releases and do not carry the maintainer's Developer ID signature or Apple notarization ticket.
+
+### Run the tests
+
+```bash
+./Scripts/build-local.sh --test
+```
+
+The `--test` option runs the unit tests before creating the Release build. It can be combined with `--open`.
 
 `project.yml` is the source of truth for the Xcode project. `Dump.xcodeproj`, the downloaded Node runtime, qmd's installed packages, and build output are generated locally and intentionally ignored by Git.
 
@@ -130,7 +138,7 @@ To work in Xcode after generation:
 open Dump.xcodeproj
 ```
 
-Release signing, notarization, and Sparkle publication require maintainer credentials. The scripts in `Scripts/` document that workflow, but contributors do not need those credentials to build and test.
+Release signing, notarization, and Sparkle publication require maintainer credentials. Contributors do not need those credentials to build and test locally. Maintainers can follow [RELEASING.md](RELEASING.md).
 
 ## Project layout
 
@@ -155,7 +163,7 @@ The app uses SwiftUI for most UI, AppKit where macOS window behavior requires it
 
 ## Contributing and support
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before participating. Use GitHub Issues for reproducible bugs and focused feature requests, but do not include private notes, credentials, or unredacted logs. External code contributions are accepted only by prior arrangement while the project remains all rights reserved.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before participating. Bug reports, focused feature requests, documentation improvements, and pull requests are welcome. Do not include private notes, credentials, or unredacted logs.
 
 Security reports belong in GitHub's private vulnerability reporting flow. See [SECURITY.md](SECURITY.md).
 
@@ -165,6 +173,4 @@ Dump bundles or links software maintained by other projects. Versions, copyright
 
 ## License
 
-Copyright © 2026 Joshua Myatt. All rights reserved.
-
-This repository is publicly viewable but is not open source. No permission to copy, modify, distribute, sublicense, sell, or create derivative works is granted except with prior written permission or as required by applicable law. See [LICENSE](LICENSE).
+Dump is available under the [MIT License](LICENSE).

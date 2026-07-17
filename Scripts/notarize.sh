@@ -15,6 +15,8 @@ set -euo pipefail
 # Optional env:
 #   DMG_NAME         output dmg base name (default: Dump)
 #   OUTPUT_DIR       defaults to build/
+#   NOTARY_KEYCHAIN  explicit keychain path containing NOTARY_PROFILE
+#   KEYCHAIN_PROFILE path to a custom keychain containing DEVELOPER_ID
 
 : "${APP_PATH:?APP_PATH must point to the signed Dump.app}"
 : "${NOTARY_PROFILE:?NOTARY_PROFILE must be a keychain profile created by notarytool store-credentials}"
@@ -23,6 +25,26 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DMG_NAME="${DMG_NAME:-Dump}"
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/build}"
+NOTARY_KEYCHAIN="${NOTARY_KEYCHAIN:-}"
+KEYCHAIN_PROFILE="${KEYCHAIN_PROFILE:-}"
+
+NOTARY_AUTH_ARGS=(--keychain-profile "$NOTARY_PROFILE")
+if [[ -n "$NOTARY_KEYCHAIN" ]]; then
+  [[ -f "$NOTARY_KEYCHAIN" ]] || {
+    echo "notarize: keychain not found at $NOTARY_KEYCHAIN" >&2
+    exit 1
+  }
+  NOTARY_AUTH_ARGS+=(--keychain "$NOTARY_KEYCHAIN")
+fi
+
+CODESIGN_KEYCHAIN_ARGS=()
+if [[ -n "$KEYCHAIN_PROFILE" ]]; then
+  [[ -f "$KEYCHAIN_PROFILE" ]] || {
+    echo "notarize: signing keychain not found at $KEYCHAIN_PROFILE" >&2
+    exit 1
+  }
+  CODESIGN_KEYCHAIN_ARGS=(--keychain "$KEYCHAIN_PROFILE")
+fi
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
 DMG_PATH="$OUTPUT_DIR/${DMG_NAME}-${VERSION}.dmg"
@@ -57,6 +79,7 @@ hdiutil create \
 log "signing DMG"
 codesign --force \
          --sign "$DEVELOPER_ID" \
+         "${CODESIGN_KEYCHAIN_ARGS[@]}" \
          --timestamp \
          "$DMG_PATH"
 
@@ -66,7 +89,7 @@ trap 'rm -rf "$STAGE_DIR" "$SUBMIT_JSON" "$LOG_JSON"' EXIT
 
 log "submitting to Apple (this typically takes 1–5 minutes)"
 xcrun notarytool submit "$DMG_PATH" \
-                  --keychain-profile "$NOTARY_PROFILE" \
+                  "${NOTARY_AUTH_ARGS[@]}" \
                   --wait \
                   --output-format json | tee "$SUBMIT_JSON"
 
@@ -78,7 +101,7 @@ if [[ "$STATUS" != "Accepted" ]]; then
   if [[ -n "$SUBMISSION_ID" ]]; then
     log "fetching Apple notary log for $SUBMISSION_ID"
     xcrun notarytool log "$SUBMISSION_ID" \
-                    --keychain-profile "$NOTARY_PROFILE" \
+                    "${NOTARY_AUTH_ARGS[@]}" \
                     --output-format json | tee "$LOG_JSON"
   fi
   die "notarization failed; not stapling $DMG_PATH"

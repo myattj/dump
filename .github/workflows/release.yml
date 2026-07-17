@@ -1,0 +1,260 @@
+name: Release DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build (for example, v0.1.3-b6)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Sign, notarize, and publish
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment:
+      name: release
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+      DEVELOPER_ID: ${{ vars.DEVELOPER_IDENTITY }}
+      XCODEGEN_VERSION: 2.46.0
+      XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.tag }}
+
+      - name: Validate tag and source version
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          [[ "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-b[0-9]+$ ]] || {
+            echo "Invalid release tag: $REQUESTED_TAG" >&2
+            exit 1
+          }
+
+          git fetch --force origin \
+            "refs/tags/${REQUESTED_TAG}:refs/tags/${REQUESTED_TAG}"
+          tag_commit="$(git rev-parse "refs/tags/${REQUESTED_TAG}^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          [[ "$tag_commit" == "$head_commit" ]] || {
+            echo "Checked-out commit $head_commit does not match tag $REQUESTED_TAG ($tag_commit)" >&2
+            exit 1
+          }
+
+          version="$(sed -n 's/^[[:space:]]*MARKETING_VERSION: "\([^"]*\)"/\1/p' project.yml)"
+          build="$(sed -n 's/^[[:space:]]*CURRENT_PROJECT_VERSION: "\([^"]*\)"/\1/p' project.yml)"
+          [[ -n "$version" && -n "$build" ]] || {
+            echo "Could not read version and build from project.yml" >&2
+            exit 1
+          }
+
+          expected_tag="v${version}-b${build}"
+          [[ "$REQUESTED_TAG" == "$expected_tag" ]] || {
+            echo "Tag $REQUESTED_TAG does not match project version $expected_tag" >&2
+            exit 1
+          }
+
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "The tagged commit is not contained in origin/main" >&2
+            exit 1
+          }
+
+          [[ -d "$DEVELOPER_DIR" ]] || {
+            echo "Pinned Xcode is unavailable at $DEVELOPER_DIR" >&2
+            exit 1
+          }
+          [[ "$(uname -m)" == "arm64" ]] || {
+            echo "Release builds require an Apple-silicon runner" >&2
+            exit 1
+          }
+
+          printf 'RELEASE_TAG=%s\nRELEASE_VERSION=%s\nRELEASE_BUILD=%s\n' \
+            "$REQUESTED_TAG" "$version" "$build" >> "$GITHUB_ENV"
+          xcodebuild -version
+
+      - name: Install pinned XcodeGen
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/xcodegen.zip"
+          install_dir="$RUNNER_TEMP/xcodegen"
+          url="https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+
+          curl -fsSL --retry 3 --output "$archive" "$url"
+          printf '%s  %s\n' "$XCODEGEN_SHA256" "$archive" | shasum -a 256 -c -
+          ditto -x -k "$archive" "$install_dir"
+          echo "$install_dir/xcodegen/bin" >> "$GITHUB_PATH"
+          "$install_dir/xcodegen/bin/xcodegen" --version
+
+      - name: Build and test without release credentials
+        run: |
+          set -euo pipefail
+          DERIVED_DATA_PATH="$RUNNER_TEMP/DumpDerivedData" \
+          OUTPUT_DIR="$RUNNER_TEMP/release" \
+          ./Scripts/package-release.sh --skip-sign --skip-notarize
+
+      - name: Import Developer ID and notary credentials
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          : "${DEVELOPER_ID:?Configure the release environment variable DEVELOPER_IDENTITY}"
+          : "${DEVELOPER_ID_P12_BASE64:?Missing DEVELOPER_ID_P12_BASE64}"
+          : "${DEVELOPER_ID_P12_PASSWORD:?Missing DEVELOPER_ID_P12_PASSWORD}"
+          : "${APPLE_NOTARY_KEY_P8:?Missing APPLE_NOTARY_KEY_P8}"
+          : "${APPLE_NOTARY_KEY_ID:?Missing APPLE_NOTARY_KEY_ID}"
+          : "${APPLE_NOTARY_ISSUER_ID:?Missing APPLE_NOTARY_ISSUER_ID}"
+
+          certificate_path="$RUNNER_TEMP/dump-developer-id.p12"
+          notary_key_path="$RUNNER_TEMP/AuthKey.p8"
+          keychain_path="$RUNNER_TEMP/dump-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+
+          printf '%s' "$DEVELOPER_ID_P12_BASE64" | base64 --decode > "$certificate_path"
+          printf '%s' "$APPLE_NOTARY_KEY_P8" > "$notary_key_path"
+          chmod 600 "$certificate_path" "$notary_key_path"
+
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$DEVELOPER_ID_P12_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
+
+          xcrun notarytool store-credentials dump-ci \
+            --key "$notary_key_path" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --keychain "$keychain_path"
+
+          printf 'SIGNING_KEYCHAIN=%s\n' "$keychain_path" >> "$GITHUB_ENV"
+
+      - name: Sign and notarize
+        run: |
+          set -euo pipefail
+          app_path="$RUNNER_TEMP/DumpDerivedData/Build/Products/Release/Dump.app"
+          [[ -d "$app_path" ]] || {
+            echo "Built app not found at $app_path" >&2
+            exit 1
+          }
+
+          APP_PATH="$app_path" \
+          DEVELOPER_ID="$DEVELOPER_ID" \
+          KEYCHAIN_PROFILE="$SIGNING_KEYCHAIN" \
+          ./Scripts/sign.sh
+
+          APP_PATH="$app_path" \
+          DEVELOPER_ID="$DEVELOPER_ID" \
+          OUTPUT_DIR="$RUNNER_TEMP/release" \
+          KEYCHAIN_PROFILE="$SIGNING_KEYCHAIN" \
+          NOTARY_KEYCHAIN="$SIGNING_KEYCHAIN" \
+          NOTARY_PROFILE=dump-ci \
+          ./Scripts/notarize.sh
+
+      - name: Verify DMG and prepare checksum
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/release"
+          dmg_path="$release_dir/Dump-${RELEASE_VERSION}.dmg"
+          checksum_path="$dmg_path.sha256"
+          mount_dir="$(mktemp -d "$RUNNER_TEMP/dump-mount.XXXXXX")"
+          mounted=0
+
+          cleanup_mount() {
+            if [[ "$mounted" == "1" ]]; then
+              hdiutil detach "$mount_dir" -quiet || true
+            fi
+          }
+          trap cleanup_mount EXIT
+
+          [[ -f "$dmg_path" ]] || {
+            echo "Expected DMG not found at $dmg_path" >&2
+            exit 1
+          }
+          codesign --verify --verbose=2 "$dmg_path"
+          xcrun stapler validate "$dmg_path"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$dmg_path"
+
+          hdiutil attach "$dmg_path" -readonly -nobrowse -mountpoint "$mount_dir" -quiet
+          mounted=1
+          app_path="$mount_dir/Dump.app"
+          [[ -d "$app_path" ]] || {
+            echo "Mounted DMG does not contain Dump.app" >&2
+            exit 1
+          }
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+          [[ "$(lipo -archs "$app_path/Contents/MacOS/Dump")" == "arm64" ]]
+          [[ "$(lipo -archs "$app_path/Contents/Resources/runtime/node/bin/node")" == "arm64" ]]
+          [[ -f "$app_path/Contents/Resources/runtime/qmd/node_modules/@tobilu/qmd/dist/cli/qmd.js" ]]
+
+          hdiutil detach "$mount_dir" -quiet
+          mounted=0
+          (cd "$release_dir" && shasum -a 256 "$(basename "$dmg_path")") > "$checksum_path"
+          printf 'DMG_PATH=%s\nCHECKSUM_PATH=%s\n' "$dmg_path" "$checksum_path" >> "$GITHUB_ENV"
+
+      - name: Create and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          existing_draft="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [[ "$existing_draft" == "false" ]]; then
+            echo "Published release $RELEASE_TAG already exists; refusing to replace it" >&2
+            exit 1
+          elif [[ "$existing_draft" == "true" ]]; then
+            echo "Resuming existing draft release $RELEASE_TAG"
+            gh release upload "$RELEASE_TAG" \
+              "$DMG_PATH#Notarized Apple-silicon DMG" \
+              "$CHECKSUM_PATH#SHA-256 checksum" \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              "$DMG_PATH#Notarized Apple-silicon DMG" \
+              "$CHECKSUM_PATH#SHA-256 checksum" \
+              --draft \
+              --verify-tag \
+              --title "Dump ${RELEASE_VERSION}" \
+              --generate-notes \
+              --notes "Official Developer ID-signed and Apple-notarized release for macOS 14 or later on Apple silicon."
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest
+
+      - name: Clean up signing material
+        if: ${{ always() }}
+        run: |
+          if [[ -f "$RUNNER_TEMP/dump-signing.keychain-db" ]]; then
+            security delete-keychain "$RUNNER_TEMP/dump-signing.keychain-db" || true
+          fi
+          rm -f \
+            "$RUNNER_TEMP/dump-developer-id.p12" \
+            "$RUNNER_TEMP/AuthKey.p8"

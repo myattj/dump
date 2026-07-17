@@ -18,10 +18,19 @@ RUNTIME_DIR="$ROOT_DIR/Runtime"
 NODE_DIR="$RUNTIME_DIR/node"
 QMD_DIR="$RUNTIME_DIR/qmd"
 WORK_DIR="$RUNTIME_DIR/.work"
+READY_STAMP="$QMD_DIR/node_modules/.runtime-ready"
 
 mkdir -p "$RUNTIME_DIR" "$WORK_DIR"
+rm -f "$READY_STAMP"
 
 log() { printf '\033[36m[fetch-runtime]\033[0m %s\n' "$*" >&2; }
+
+qmd_package_version() {
+  local package_path="$1"
+  "$NODE_DIR/bin/node" \
+    -e 'process.stdout.write(require(process.argv[1]).version || "")' \
+    "$package_path" 2>/dev/null || true
+}
 
 fetch_node() {
   if [[ -x "$NODE_DIR/bin/node" ]]; then
@@ -61,13 +70,17 @@ fetch_node() {
 
 install_qmd() {
   if [[ -d "$QMD_DIR/node_modules/@tobilu/qmd" ]]; then
+    local package_path="$QMD_DIR/node_modules/@tobilu/qmd/package.json"
+    local cli_path="$QMD_DIR/node_modules/@tobilu/qmd/dist/cli/qmd.js"
     local installed
-    installed="$(node -p "require('$QMD_DIR/node_modules/@tobilu/qmd/package.json').version" 2>/dev/null || true)"
-    if [[ "$installed" == "$QMD_VERSION" ]]; then
+    local cli_version
+    installed="$(qmd_package_version "$package_path")"
+    cli_version="$("$NODE_DIR/bin/node" "$cli_path" --version 2>/dev/null || true)"
+    if [[ "$installed" == "$QMD_VERSION" && "$cli_version" == *"$QMD_VERSION"* ]]; then
       log "qmd ${QMD_VERSION} already installed, skipping"
       return
     fi
-    log "replacing qmd $installed with $QMD_VERSION"
+    log "replacing incomplete qmd ${installed:-install} with $QMD_VERSION"
     rm -rf "$QMD_DIR/node_modules"
   fi
 
@@ -110,21 +123,47 @@ JSON
        \( -name "*-darwin-x64" -o -name "*-linux-*" -o -name "*-win32-*" \) \
        -prune -exec rm -rf {} + 2>/dev/null || true
 
-  # Sanity check the CLI entry QMDDaemonController launches.
-  local cli_src="$QMD_DIR/node_modules/@tobilu/qmd/dist/cli/qmd.js"
-  if [[ ! -f "$cli_src" ]]; then
-    echo "fetch-runtime: expected qmd CLI at $cli_src — package layout changed; update QMDDaemonController.qmdEntryURL" >&2
+  log "qmd installed at $QMD_DIR"
+}
+
+validate_runtime() {
+  local node_version
+  node_version="$("$NODE_DIR/bin/node" --version 2>/dev/null || true)"
+  if [[ "$node_version" != "v${NODE_VERSION}" ]]; then
+    echo "fetch-runtime: expected Node v${NODE_VERSION}, found ${node_version:-nothing}" >&2
     exit 1
   fi
-  local cli_ver
-  cli_ver="$("$NODE_DIR/bin/node" "$cli_src" --version 2>/dev/null || true)"
-  log "qmd CLI version: ${cli_ver:-unknown}"
 
-  log "qmd installed at $QMD_DIR"
+  local qmd_package="$QMD_DIR/node_modules/@tobilu/qmd/package.json"
+  local qmd_cli="$QMD_DIR/node_modules/@tobilu/qmd/dist/cli/qmd.js"
+  if [[ ! -f "$qmd_package" || ! -f "$qmd_cli" ]]; then
+    echo "fetch-runtime: expected qmd CLI at $qmd_cli — package layout changed or install is incomplete" >&2
+    exit 1
+  fi
+
+  local installed_qmd
+  installed_qmd="$(qmd_package_version "$qmd_package")"
+  if [[ "$installed_qmd" != "$QMD_VERSION" ]]; then
+    echo "fetch-runtime: expected qmd ${QMD_VERSION}, found ${installed_qmd:-nothing}" >&2
+    exit 1
+  fi
+
+  local cli_version
+  cli_version="$("$NODE_DIR/bin/node" "$qmd_cli" --version 2>/dev/null || true)"
+  if [[ -z "$cli_version" || "$cli_version" != *"$QMD_VERSION"* ]]; then
+    echo "fetch-runtime: qmd CLI validation failed (reported ${cli_version:-nothing})" >&2
+    exit 1
+  fi
+
+  local stamp_tmp="${READY_STAMP}.tmp.$$"
+  printf 'node=%s\nqmd=%s\n' "$NODE_VERSION" "$QMD_VERSION" > "$stamp_tmp"
+  mv "$stamp_tmp" "$READY_STAMP"
+  log "qmd CLI version: $cli_version"
 }
 
 fetch_node
 install_qmd
+validate_runtime
 
 rm -rf "$WORK_DIR"
 log "done. Runtime ready at $RUNTIME_DIR"
