@@ -21,13 +21,13 @@ NODE_ENTITLEMENTS="${NODE_ENTITLEMENTS:-$ROOT_DIR/Resources/Node.entitlements}"
 RUNTIME_INSIDE_APP="$APP_PATH/Contents/Resources/runtime"
 KEYCHAIN_PROFILE="${KEYCHAIN_PROFILE:-}"
 
-CODESIGN_KEYCHAIN_ARGS=()
+CODESIGN_ARGS=(--force --sign "$DEVELOPER_ID")
 if [[ -n "$KEYCHAIN_PROFILE" ]]; then
   [[ -f "$KEYCHAIN_PROFILE" ]] || {
     echo "sign.sh: keychain not found at $KEYCHAIN_PROFILE" >&2
     exit 1
   }
-  CODESIGN_KEYCHAIN_ARGS=(--keychain "$KEYCHAIN_PROFILE")
+  CODESIGN_ARGS+=(--keychain "$KEYCHAIN_PROFILE")
 fi
 
 if [[ ! -d "$APP_PATH" ]]; then
@@ -44,9 +44,7 @@ log() { printf '\033[35m[sign]\033[0m %s\n' "$*" >&2; }
 codesign_one() {
   local file="$1"
   shift || true
-  codesign --force \
-           --sign "$DEVELOPER_ID" \
-           "${CODESIGN_KEYCHAIN_ARGS[@]}" \
+  codesign "${CODESIGN_ARGS[@]}" \
            --options runtime \
            --timestamp \
            "$@" \
@@ -74,10 +72,8 @@ while IFS= read -r -d '' candidate; do
 done < <(find "$RUNTIME_INSIDE_APP" -type f -print0)
 
 log "signing Dump.app with entitlements"
-codesign --force \
+codesign "${CODESIGN_ARGS[@]}" \
          --deep \
-         --sign "$DEVELOPER_ID" \
-         "${CODESIGN_KEYCHAIN_ARGS[@]}" \
          --options runtime \
          --timestamp \
          --entitlements "$ENTITLEMENTS" \

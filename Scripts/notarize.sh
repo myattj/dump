@@ -37,13 +37,13 @@ if [[ -n "$NOTARY_KEYCHAIN" ]]; then
   NOTARY_AUTH_ARGS+=(--keychain "$NOTARY_KEYCHAIN")
 fi
 
-CODESIGN_KEYCHAIN_ARGS=()
+DMG_CODESIGN_ARGS=(--force --sign "$DEVELOPER_ID")
 if [[ -n "$KEYCHAIN_PROFILE" ]]; then
   [[ -f "$KEYCHAIN_PROFILE" ]] || {
     echo "notarize: signing keychain not found at $KEYCHAIN_PROFILE" >&2
     exit 1
   }
-  CODESIGN_KEYCHAIN_ARGS=(--keychain "$KEYCHAIN_PROFILE")
+  DMG_CODESIGN_ARGS+=(--keychain "$KEYCHAIN_PROFILE")
 fi
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")"
@@ -77,9 +77,7 @@ hdiutil create \
         "$DMG_PATH"
 
 log "signing DMG"
-codesign --force \
-         --sign "$DEVELOPER_ID" \
-         "${CODESIGN_KEYCHAIN_ARGS[@]}" \
+codesign "${DMG_CODESIGN_ARGS[@]}" \
          --timestamp \
          "$DMG_PATH"
 
