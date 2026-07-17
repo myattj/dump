@@ -3,23 +3,27 @@ import Foundation
 /// Local answer synthesis through Ollama's `/api/chat` endpoint.
 public struct OllamaSynthesizer: Synthesizing {
     private let transport: HTTPTransporting
-    private let endpoint: URL
-    private let model: String
+    private let configStore: CustomLLMConfigStore
+    private let endpointOverride: URL?
+    private let modelOverride: String?
 
     public init(
         transport: HTTPTransporting = HTTPTransport(),
-        endpoint: URL = CustomLLMConfigStore.shared.ollamaChatURL(),
-        model: String = CustomLLMConfigStore.shared.ollamaModel
+        configStore: CustomLLMConfigStore = .shared,
+        endpoint: URL? = nil,
+        model: String? = nil
     ) {
         self.transport = transport
-        self.endpoint = endpoint
-        self.model = model
+        self.configStore = configStore
+        self.endpointOverride = endpoint
+        self.modelOverride = model
     }
 
     public func synthesize(query: String, hits: [QueryEngine.Hit]) async throws -> SynthesisResult {
+        let configuration = configuration()
         let prompt = ClaudeSynthesizer.buildPrompt(query: query, hits: hits)
         let payload = ChatRequest(
-            model: model,
+            model: configuration.model,
             messages: [
                 .init(role: "system", content: ClaudeSynthesizer.systemPrompt),
                 .init(role: "user", content: prompt),
@@ -30,7 +34,7 @@ public struct OllamaSynthesizer: Synthesizing {
         let body = try JSONEncoder().encode(payload)
         let req = HTTPRequest(
             method: "POST",
-            url: endpoint,
+            url: configuration.endpoint,
             headers: ["Content-Type": "application/json"],
             body: body,
             timeout: 60
@@ -50,12 +54,13 @@ public struct OllamaSynthesizer: Synthesizing {
     /// True token streaming: Ollama's chat endpoint emits NDJSON — one
     /// `{"message":{"content":…},"done":…}` object per line.
     public func synthesizeStream(query: String, hits: [QueryEngine.Hit]) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
+        let configuration = configuration()
+        return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     let prompt = ClaudeSynthesizer.buildPrompt(query: query, hits: hits)
                     let payload = ChatRequest(
-                        model: model,
+                        model: configuration.model,
                         messages: [
                             .init(role: "system", content: ClaudeSynthesizer.systemPrompt),
                             .init(role: "user", content: prompt),
@@ -66,7 +71,7 @@ public struct OllamaSynthesizer: Synthesizing {
                     let body = try JSONEncoder().encode(payload)
                     let req = HTTPRequest(
                         method: "POST",
-                        url: endpoint,
+                        url: configuration.endpoint,
                         headers: ["Content-Type": "application/json"],
                         body: body,
                         timeout: 60
@@ -93,6 +98,14 @@ public struct OllamaSynthesizer: Synthesizing {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    private func configuration() -> OllamaConfiguration {
+        let stored = configStore.ollamaConfiguration()
+        return OllamaConfiguration(
+            endpoint: endpointOverride ?? stored.endpoint,
+            model: modelOverride ?? stored.model
+        )
     }
 
     private struct ChatRequest: Encodable {

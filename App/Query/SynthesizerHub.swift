@@ -39,7 +39,7 @@ public actor SynthesizerHub: Synthesizing {
         self.modeReader = SynthesizerModeReader(defaults: defaults)
         self.claude = claude ?? ClaudeSynthesizer(keychain: keychain, transport: transport, configStore: configStore)
         self.planBacked = planBacked ?? PlanBackedSynthesizer(configStore: configStore)
-        self.ollama = ollama ?? OllamaSynthesizer(transport: transport, endpoint: configStore.ollamaChatURL(), model: configStore.ollamaModel)
+        self.ollama = ollama ?? OllamaSynthesizer(transport: transport, configStore: configStore)
         self.custom = custom ?? CustomLLMSynthesizer(keychain: keychain, configStore: configStore, transport: transport)
         self.bedrock = bedrock ?? BedrockSynthesizer(keychain: keychain, configStore: configStore, transport: transport)
     }

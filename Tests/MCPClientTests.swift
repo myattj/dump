@@ -71,4 +71,41 @@ final class MCPClientTests: XCTestCase {
         XCTAssertEqual(arguments?["limit"] as? Int, 10)
         XCTAssertEqual(arguments?["rerank"] as? Bool, true)
     }
+
+    func testCLIProcessCancellationTerminatesOwnedProcess() async throws {
+        let runner = QMDCLIProcessRunner(
+            executable: URL(fileURLWithPath: "/bin/sleep"),
+            arguments: ["30"],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let task = Task { try await runner.run() }
+
+        var launchedPID: pid_t?
+        for _ in 0..<200 {
+            if let pid = runner.runningProcessIdentifier() {
+                launchedPID = pid
+                break
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let pid = try XCTUnwrap(launchedPID)
+        defer {
+            if Darwin.kill(pid, 0) == 0 {
+                Darwin.kill(pid, SIGKILL)
+            }
+        }
+
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected: cancellation owns and terminates this exact child.
+        }
+
+        for _ in 0..<200 where Darwin.kill(pid, 0) == 0 {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNotEqual(Darwin.kill(pid, 0), 0)
+    }
 }

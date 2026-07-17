@@ -21,6 +21,8 @@ public final class AppCoordinator: ObservableObject {
     public let updates: UpdateController
     public let logger = Logger(subsystem: "com.joshmyatt.dump", category: "coordinator")
 
+    private var daemonStartup: Task<Void, Never>?
+    private var storageTransition: Task<Void, Never>?
     private var heartbeat: Task<Void, Never>?
     private var hotkeyPreferenceObserver: AnyCancellable?
     private var wakeObserver: NSObjectProtocol?
@@ -98,12 +100,15 @@ public final class AppCoordinator: ObservableObject {
                     self?.registerHotkeys()
                 }
             }
-        Task {
-            await daemon.startIfNeeded()
+        daemonStartup?.cancel()
+        daemonStartup = Task { [weak self] in
+            guard let self, !Task.isCancelled else { return }
+            await self.daemon.startIfNeeded()
+            guard !Task.isCancelled else { return }
             DiagnosticLog.event(.info, category: "qmd", "daemon start completed", metadata: [
-                "state": String(describing: await daemon.currentState()),
+                "state": String(describing: await self.daemon.currentState()),
             ])
-            await bootstrapCollections()
+            await self.bootstrapCollections()
         }
         Task { await scheduler.reconcile() }
         queue.refresh()
@@ -176,6 +181,7 @@ public final class AppCoordinator: ObservableObject {
     private func bootstrapCollections(forceRebind: Bool = false) async {
         let engine = QueryEngine(daemon: daemon)
         let existing = (try? await engine.collectionNames()) ?? []
+        guard !Task.isCancelled else { return }
         let known = Set(existing)
         var entries: [(name: String, root: URL, glob: String, createDirectory: Bool)] = [
             ("inbox", storage.subdirectory(.inbox), "**/*.md", true),
@@ -183,6 +189,7 @@ public final class AppCoordinator: ObservableObject {
             ("pdfs", storage.subdirectory(.pdfs), "**/*.md", true),
         ]
         let savedCodeCollections = await CodeCollectionStore(engine: engine).list()
+        guard !Task.isCancelled else { return }
         entries.append(contentsOf: savedCodeCollections.map { collection in
             (
                 name: "code-\(collection.id)",
@@ -193,6 +200,7 @@ public final class AppCoordinator: ObservableObject {
         })
         var added = false
         for entry in entries {
+            guard !Task.isCancelled else { return }
             if known.contains(entry.name) {
                 guard forceRebind else { continue }
                 do {
@@ -234,15 +242,22 @@ public final class AppCoordinator: ObservableObject {
                 ])
             }
         }
-        if added {
+        if added, !Task.isCancelled {
             DiagnosticLog.event(.info, category: "qmd", "updating index after collection bootstrap")
             try? await engine.updateIndex()
+            guard !Task.isCancelled else { return }
             try? await engine.embed()
         }
     }
 
-    public func stop() {
+    public func stop() async {
         DiagnosticLog.event(.info, category: "app", "stopping Dump")
+        let startup = daemonStartup
+        daemonStartup = nil
+        startup?.cancel()
+        let transition = storageTransition
+        storageTransition = nil
+        transition?.cancel()
         hotkeys.unregisterAll()
         hotkeyPreferenceObserver?.cancel()
         hotkeyPreferenceObserver = nil
@@ -257,7 +272,9 @@ public final class AppCoordinator: ObservableObject {
             NotificationCenter.default.removeObserver(dayChangeObserver)
             self.dayChangeObserver = nil
         }
-        Task { await daemon.stop() }
+        if let startup { await startup.value }
+        if let transition { await transition.value }
+        await daemon.stop()
     }
 
     public func setStorageRoot(_ url: URL) {
@@ -269,22 +286,36 @@ public final class AppCoordinator: ObservableObject {
     }
 
     private func transitionStorageRoot(to url: URL?) {
+        storageTransition?.cancel()
         storageTransitionGeneration &+= 1
         let generation = storageTransitionGeneration
-        Task { [weak self] in
+        storageTransition = Task { [weak self] in
             guard let self else { return }
+            defer {
+                if generation == self.storageTransitionGeneration {
+                    self.storageTransition = nil
+                }
+            }
+            guard !Task.isCancelled else { return }
             await self.scheduler.cancelAllPending()
-            guard generation == self.storageTransitionGeneration else { return }
+            guard !Task.isCancelled,
+                  generation == self.storageTransitionGeneration else { return }
             if let url {
                 self.storage.setRoot(url)
             } else {
                 self.storage.reset()
             }
             DiagnosticLog.event(.info, category: "storage", "storage root changed")
+            guard !Task.isCancelled else { return }
             await self.daemon.restart()
-            guard generation == self.storageTransitionGeneration else { return }
+            guard !Task.isCancelled,
+                  generation == self.storageTransitionGeneration else { return }
             await self.bootstrapCollections(forceRebind: true)
+            guard !Task.isCancelled,
+                  generation == self.storageTransitionGeneration else { return }
             _ = await self.scheduler.reconcile()
+            guard !Task.isCancelled,
+                  generation == self.storageTransitionGeneration else { return }
             self.queue.refresh()
         }
     }

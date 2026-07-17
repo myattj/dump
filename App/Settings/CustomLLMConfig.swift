@@ -1,5 +1,10 @@
 import Foundation
 
+struct OllamaConfiguration: Sendable {
+    let endpoint: URL
+    let model: String
+}
+
 /// User-supplied connection details for an OpenAI-compatible HTTPS endpoint
 /// (Azure OpenAI, vLLM/LiteLLM/OpenRouter gateways, enterprise proxies, etc.).
 /// Base URL + model names live in UserDefaults; the API key lives in Keychain
@@ -23,6 +28,10 @@ public final class CustomLLMConfigStore: @unchecked Sendable {
     }
 
     private let defaults: UserDefaults
+    private let ollamaConfigurationLock = NSLock()
+
+    private static let defaultOllamaBaseURL = "http://127.0.0.1:11434"
+    private static let defaultOllamaModel = "llama3.2:3b"
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -54,13 +63,38 @@ public final class CustomLLMConfigStore: @unchecked Sendable {
     /// Base URL for a local Ollama server. Stored as a base instead of the
     /// final `/api/chat` endpoint so settings can present the familiar host.
     public var ollamaBaseURL: String {
-        get { defaults.string(forKey: DefaultsKey.ollamaBaseURL) ?? "http://127.0.0.1:11434" }
-        set { defaults.set(newValue, forKey: DefaultsKey.ollamaBaseURL) }
+        get {
+            ollamaConfigurationLock.withLock {
+                defaults.string(forKey: DefaultsKey.ollamaBaseURL) ?? Self.defaultOllamaBaseURL
+            }
+        }
+        set {
+            ollamaConfigurationLock.withLock {
+                defaults.set(newValue, forKey: DefaultsKey.ollamaBaseURL)
+            }
+        }
     }
 
     public var ollamaModel: String {
-        get { defaults.string(forKey: DefaultsKey.ollamaModel) ?? "llama3.2:3b" }
-        set { defaults.set(newValue, forKey: DefaultsKey.ollamaModel) }
+        get {
+            ollamaConfigurationLock.withLock {
+                defaults.string(forKey: DefaultsKey.ollamaModel) ?? Self.defaultOllamaModel
+            }
+        }
+        set {
+            ollamaConfigurationLock.withLock {
+                defaults.set(newValue, forKey: DefaultsKey.ollamaModel)
+            }
+        }
+    }
+
+    /// Persists both fields as one update so new requests cannot observe a
+    /// server from one save paired with a model from another.
+    public func saveOllama(baseURL: String, model: String) {
+        ollamaConfigurationLock.withLock {
+            defaults.set(baseURL, forKey: DefaultsKey.ollamaBaseURL)
+            defaults.set(model, forKey: DefaultsKey.ollamaModel)
+        }
     }
 
     /// AWS Region for Bedrock Runtime, e.g. `us-east-1`.
@@ -137,8 +171,20 @@ public final class CustomLLMConfigStore: @unchecked Sendable {
 
     /// Ollama may use plaintext HTTP only on the local loopback interface.
     public func ollamaChatURL() -> URL {
+        ollamaConfiguration().endpoint
+    }
+
+    func ollamaConfiguration() -> OllamaConfiguration {
+        ollamaConfigurationLock.withLock {
+            let baseURL = defaults.string(forKey: DefaultsKey.ollamaBaseURL) ?? Self.defaultOllamaBaseURL
+            let model = defaults.string(forKey: DefaultsKey.ollamaModel) ?? Self.defaultOllamaModel
+            return OllamaConfiguration(endpoint: Self.ollamaChatURL(from: baseURL), model: model)
+        }
+    }
+
+    private static func ollamaChatURL(from baseURL: String) -> URL {
         let fallback = URL(string: "http://127.0.0.1:11434/api/chat")!
-        guard let url = Self.ollamaURL(from: ollamaBaseURL) else { return fallback }
+        guard let url = Self.ollamaURL(from: baseURL) else { return fallback }
         if url.path.hasSuffix("/api/chat") { return url }
         return url.appendingPathComponent("api/chat")
     }

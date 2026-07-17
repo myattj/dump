@@ -94,7 +94,7 @@ public actor ClassifierHub {
         let transport = HTTPTransport(session: urlSession)
         self.claude = claude ?? ClaudeClassifier(keychain: keychain, transport: transport, configStore: configStore)
         self.planBacked = planBacked ?? PlanBackedClassifier(configStore: configStore)
-        self.ollama = ollama ?? OllamaClassifier(transport: transport)
+        self.ollama = ollama ?? OllamaClassifier(transport: transport, configStore: configStore)
         self.custom = custom ?? CustomLLMClassifier(keychain: keychain, configStore: configStore, transport: transport)
         self.bedrock = bedrock ?? BedrockClassifier(keychain: keychain, configStore: configStore, transport: transport)
     }

@@ -575,8 +575,7 @@ struct OnboardingView: View {
                 logKeychainFailure(error)
             }
         case .local:
-            configStore.ollamaBaseURL = ollamaBaseURL
-            configStore.ollamaModel = ollamaModel
+            configStore.saveOllama(baseURL: ollamaBaseURL, model: ollamaModel)
         }
         Task { await coordinator.classifierHub.setMode(mode) }
     }

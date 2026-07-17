@@ -226,6 +226,61 @@ final class OllamaSynthesizerTests: XCTestCase {
         XCTAssertEqual(result.text, "Local answer [1].")
         XCTAssertEqual(result.citations.first?.path, "x/p")
     }
+
+    func testLongLivedHubsUseNewOllamaSettingsWithoutRestart() async throws {
+        let suiteName = "ollama-live-settings-\(UUID().uuidString)"
+        // The suite shares persisted values; separate handles avoid sending
+        // one non-Sendable UserDefaults instance into two actors.
+        let configDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let classifierDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let synthesizerDefaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { UserDefaults.standard.removePersistentDomain(forName: suiteName) }
+        configDefaults.set(ClassifierMode.local.rawValue, forKey: ClassifierModePreference.defaultsKey)
+
+        let configStore = CustomLLMConfigStore(defaults: configDefaults)
+        configStore.saveOllama(baseURL: "https://old-ollama.example.com", model: "old-model")
+
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.protocolClasses = [RecordingURLProtocol.self]
+        let session = URLSession(configuration: sessionConfiguration)
+        RecordingURLProtocol.reset()
+        defer {
+            session.invalidateAndCancel()
+            RecordingURLProtocol.reset()
+        }
+
+        let classifierHub = ClassifierHub(
+            keychain: KeychainStore(service: "ollama-live-settings.\(UUID().uuidString)"),
+            configStore: configStore,
+            urlSession: session,
+            defaults: classifierDefaults
+        )
+        let synthesizerHub = SynthesizerHub(
+            keychain: KeychainStore(service: "ollama-live-settings.\(UUID().uuidString)"),
+            configStore: configStore,
+            urlSession: session,
+            defaults: synthesizerDefaults
+        )
+
+        configStore.saveOllama(baseURL: "https://new-ollama.example.com", model: "new-model")
+
+        let classified = await classifierHub.classify("updated settings", now: Date())
+        let synthesized = try await synthesizerHub.synthesize(query: "updated settings", hits: [])
+        let activeIdentifier = await classifierHub.activeIdentifier
+
+        XCTAssertEqual(classified.type, .note)
+        XCTAssertFalse(synthesized.text.isEmpty)
+        XCTAssertEqual(activeIdentifier, "ollama:new-model")
+
+        let requests = RecordingURLProtocol.requests
+        XCTAssertEqual(requests.count, 2)
+        for request in requests {
+            XCTAssertEqual(request.url?.absoluteString, "https://new-ollama.example.com/api/chat")
+            let body = try XCTUnwrap(request.body)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            XCTAssertEqual(json["model"] as? String, "new-model")
+        }
+    }
 }
 
 final class SynthesizerHubTests: XCTestCase {
@@ -525,6 +580,34 @@ final class StreamingSynthesisTests: XCTestCase {
         )
         let deltas = try await collect(synth.synthesizeStream(query: "q", hits: []))
         XCTAssertEqual(deltas, ["Local", " answer"])
+    }
+
+    func testOllamaStreamUsesSettingsSavedAfterClientCreation() async throws {
+        let suiteName = "ollama-live-stream-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { UserDefaults.standard.removePersistentDomain(forName: suiteName) }
+        let store = CustomLLMConfigStore(defaults: defaults)
+        store.saveOllama(baseURL: "https://old-stream.example.com", model: "old-stream-model")
+
+        let transport = MockHTTPTransport()
+        transport.setFallback { _ in
+            HTTPResponse(
+                status: 200,
+                headers: [:],
+                body: Data("{\"message\":{\"content\":\"Updated\"},\"done\":true}\n".utf8)
+            )
+        }
+        let synth = OllamaSynthesizer(transport: transport, configStore: store)
+
+        store.saveOllama(baseURL: "https://new-stream.example.com", model: "new-stream-model")
+        let deltas = try await collect(synth.synthesizeStream(query: "q", hits: []))
+
+        XCTAssertEqual(deltas, ["Updated"])
+        let request = try XCTUnwrap(transport.sentRequests.first)
+        XCTAssertEqual(request.url.absoluteString, "https://new-stream.example.com/api/chat")
+        let body = try XCTUnwrap(request.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(json["model"] as? String, "new-stream-model")
     }
 
     func testOllamaStreamSurfacesErrorLine() async throws {
