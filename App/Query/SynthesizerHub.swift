@@ -1,5 +1,20 @@
 import Foundation
 
+/// `UserDefaults` is thread-safe, but the macOS 15 SDK does not declare it
+/// `Sendable`. Keep it inside one audited wrapper so the synchronous streaming
+/// requirement can read the current provider without crossing the actor.
+private final class SynthesizerModeReader: @unchecked Sendable {
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
+    }
+
+    func read() -> ClassifierMode {
+        ClassifierModePreference.read(from: defaults)
+    }
+}
+
 /// Routes synthesis to the backend matching the classifier-mode toggle.
 public actor SynthesizerHub: Synthesizing {
     private let claude: Synthesizing
@@ -7,7 +22,7 @@ public actor SynthesizerHub: Synthesizing {
     private let ollama: Synthesizing
     private let custom: Synthesizing
     private let bedrock: Synthesizing
-    nonisolated(unsafe) private let defaults: UserDefaults
+    private let modeReader: SynthesizerModeReader
 
     public init(
         keychain: KeychainStore = .shared,
@@ -21,7 +36,7 @@ public actor SynthesizerHub: Synthesizing {
         bedrock: Synthesizing? = nil
     ) {
         let transport = HTTPTransport(session: urlSession)
-        self.defaults = defaults
+        self.modeReader = SynthesizerModeReader(defaults: defaults)
         self.claude = claude ?? ClaudeSynthesizer(keychain: keychain, transport: transport, configStore: configStore)
         self.planBacked = planBacked ?? PlanBackedSynthesizer(configStore: configStore)
         self.ollama = ollama ?? OllamaSynthesizer(transport: transport, endpoint: configStore.ollamaChatURL(), model: configStore.ollamaModel)
@@ -41,10 +56,9 @@ public actor SynthesizerHub: Synthesizing {
     }
 
     /// nonisolated so the non-async stream requirement can route without an
-    /// actor hop — all state it reads is immutable (`let` backends) or the
-    /// already-nonisolated defaults.
+    /// actor hop — all state it reads is immutable and Sendable.
     private nonisolated var currentBackend: Synthesizing {
-        switch ClassifierModePreference.read(from: defaults) {
+        switch modeReader.read() {
         case .cloud: claude
         case .subscription: planBacked
         case .local: ollama
