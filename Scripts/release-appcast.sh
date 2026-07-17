@@ -6,8 +6,8 @@ set -euo pipefail
 # update with the EdDSA private key it finds in the user's keychain.
 #
 # Required env:
-#   RELEASE_DIR     directory containing *.dmg releases (and the produced
-#                   appcast.xml). Typically synced to GitHub Pages / S3.
+#   RELEASE_DIR     temporary staging directory containing the existing
+#                   appcast.xml and the new DMG
 #   APPCAST_URL     public URL where appcast.xml will be served from
 #   DOWNLOAD_URL_PREFIX
 #                   public directory containing the DMG assets; this can be
@@ -72,4 +72,4 @@ if [[ ! -f "$RELEASE_DIR/appcast.xml" ]]; then
 fi
 
 log "appcast at $RELEASE_DIR/appcast.xml"
-log "next: upload \$RELEASE_DIR/* to your static host so $APPCAST_URL serves it"
+log "next: publish $RELEASE_DIR/appcast.xml at $APPCAST_URL; DMGs stay at ${DOWNLOAD_URL_PREFIX%/}/"
