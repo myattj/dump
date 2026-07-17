@@ -263,9 +263,11 @@ struct VisualEffectBackground: NSViewRepresentable {
 extension View {
     /// Apply Liquid Glass on macOS 26+, falling back to an ultra-thin
     /// material on earlier systems so the app still looks correct on
-    /// macOS 14, 15, etc.
+    /// macOS 14, 15, etc. Xcode 16 cannot parse the macOS 26 glass APIs,
+    /// so it compiles the same fallback for every deployment target.
     @ViewBuilder
     func liquidGlass<S: InsettableShape>(in shape: S, interactive: Bool = false) -> some View {
+#if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             self.glassEffect(interactive ? .regular.interactive() : .regular, in: shape)
         } else {
@@ -273,6 +275,11 @@ extension View {
                 .background(.ultraThinMaterial, in: shape)
                 .overlay(shape.strokeBorder(DumpUI.SemanticStyle.hairline, lineWidth: 0.5))
         }
+#else
+        self
+            .background(.ultraThinMaterial, in: shape)
+            .overlay(shape.strokeBorder(DumpUI.SemanticStyle.hairline, lineWidth: 0.5))
+#endif
     }
 }
 
@@ -282,11 +289,15 @@ struct LiquidGlassGroup<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     var body: some View {
+#if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             GlassEffectContainer { content() }
         } else {
             content()
         }
+#else
+        content()
+#endif
     }
 }
 
