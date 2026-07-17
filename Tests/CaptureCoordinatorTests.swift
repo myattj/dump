@@ -15,8 +15,9 @@ final class CaptureCoordinatorTests: XCTestCase {
     var scheduler: SchedulerService!
     var notif: MockNotificationCenter!
 
+    // Xcode 16 declares XCTest's async base hook as nonisolated, so an
+    // @MainActor test case must perform its setup without calling that no-op.
     override func setUp() async throws {
-        try await super.setUp()
         tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("dump-cap-\(UUID().uuidString)", isDirectory: true)
         defaults = UserDefaults(suiteName: "cap.\(UUID())")!
@@ -42,12 +43,12 @@ final class CaptureCoordinatorTests: XCTestCase {
         scheduler = SchedulerService(storage: storage, writer: MarkdownWriter(), notifications: notif)
     }
 
+    // See setUp(): the XCTest base implementation has no work to preserve.
     override func tearDown() async throws {
         await daemon?.stop()
         try? FileManager.default.removeItem(at: tempRoot)
         qmdClient = nil
         queryEngine = nil
-        try await super.tearDown()
     }
 
     func testQuickCaptureWritesFileAndClassifies() async throws {

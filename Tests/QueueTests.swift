@@ -438,8 +438,9 @@ final class QueueViewModelSelectionTests: XCTestCase {
     var scheduler: SchedulerService!
     var viewModel: QueueViewModel!
 
+    // Xcode 16 declares XCTest's async base hook as nonisolated, so an
+    // @MainActor test case must perform its setup without calling that no-op.
     override func setUp() async throws {
-        try await super.setUp()
         tempRoot = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("dump-queue-vm-\(UUID().uuidString)", isDirectory: true)
         defaults = UserDefaults(suiteName: "queue.vm.\(UUID())")!
@@ -467,6 +468,7 @@ final class QueueViewModelSelectionTests: XCTestCase {
         )
     }
 
+    // See setUp(): the XCTest base implementation has no work to preserve.
     override func tearDown() async throws {
         try? FileManager.default.removeItem(at: tempRoot)
         viewModel = nil
@@ -475,7 +477,6 @@ final class QueueViewModelSelectionTests: XCTestCase {
         writer = nil
         storage = nil
         defaults = nil
-        try await super.tearDown()
     }
 
     func testRefreshDoesNotSelectFirstItemAutomatically() async throws {
