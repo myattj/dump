@@ -9,7 +9,9 @@ set -euo pipefail
 #   RELEASE_DIR     directory containing *.dmg releases (and the produced
 #                   appcast.xml). Typically synced to GitHub Pages / S3.
 #   APPCAST_URL     public URL where appcast.xml will be served from
-#                   (so generate_appcast can write the right enclosures)
+#   DOWNLOAD_URL_PREFIX
+#                   public directory containing the DMG assets; this can be
+#                   different from the host serving appcast.xml
 # Optional env:
 #   GENERATE_APPCAST  path to Sparkle's generate_appcast tool. If unset,
 #                     we look for it under Sparkle's SwiftPM checkout
@@ -20,6 +22,7 @@ set -euo pipefail
 
 : "${RELEASE_DIR:?RELEASE_DIR must contain the .dmg files to publish}"
 : "${APPCAST_URL:?APPCAST_URL must be the public URL of appcast.xml}"
+: "${DOWNLOAD_URL_PREFIX:?DOWNLOAD_URL_PREFIX must be the public URL directory containing the DMGs}"
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -55,7 +58,7 @@ fi
 
 log "using $TOOL"
 
-ARGS=("$RELEASE_DIR" --download-url-prefix "$(dirname "$APPCAST_URL")/")
+ARGS=("$RELEASE_DIR" --download-url-prefix "${DOWNLOAD_URL_PREFIX%/}/")
 if [[ -n "${ED_KEY_PATH:-}" ]]; then
   ARGS+=(--ed-key-file "$ED_KEY_PATH")
 fi

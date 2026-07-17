@@ -1,6 +1,6 @@
 # Third-party notices
 
-Dump links or bundles third-party software. Those components are not covered by Dump's all-rights-reserved source notice; their own licenses control.
+Dump links or bundles third-party software. Those components remain governed by their own licenses rather than Dump's MIT License.
 
 The versions below come from `project.yml`, `Scripts/fetch-runtime.sh`, and `Runtime/qmd/package-lock.json`.
 

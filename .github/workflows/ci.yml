@@ -21,7 +21,9 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -32,15 +34,9 @@ jobs:
       - name: Validate shell scripts
         run: bash -n Scripts/*.sh
 
-      - name: Generate Xcode project
-        run: xcodegen generate
-
-      - name: Fetch pinned runtime
-        run: ./Scripts/fetch-runtime.sh
+      - name: Build public checkout and run tests
+        run: ./Scripts/build-local.sh --test
 
       - name: Audit runtime dependencies
         working-directory: Runtime/qmd
         run: npm audit --omit=dev --audit-level=high
-
-      - name: Build and test
-        run: xcodebuild -project Dump.xcodeproj -scheme Dump -derivedDataPath "$RUNNER_TEMP/DumpDerivedData" -destination 'platform=macOS,arch=arm64' CODE_SIGNING_ALLOWED=NO test
