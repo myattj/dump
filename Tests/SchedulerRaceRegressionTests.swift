@@ -3,9 +3,9 @@ import os
 import XCTest
 @testable import Dump
 
-/// TEMPORARY repro for review claim: reconcile's stale frontmatter
-/// write-back resurrecting a just-completed entry. Delete after review.
-final class RaceReproTests: XCTestCase {
+/// Regression coverage for completing an entry while notification
+/// reconciliation is suspended in the scheduling call.
+final class SchedulerRaceRegressionTests: XCTestCase {
     var tempRoot: URL!
     var storage: StoragePreference!
     var defaults: UserDefaults!
@@ -94,7 +94,7 @@ final class RaceReproTests: XCTestCase {
         func pending() async -> Set<String> { [] }
     }
 
-    func testMarkDoneDuringReconcileStampWindowIsRevertedByStaleWriteBack() async throws {
+    func testMarkDoneDuringReconcileDoesNotRestoreStaleFrontmatter() async throws {
         let writer = MarkdownWriter()
         let now = Date()
         // Fresh entry: active, future fire date, no notification_id yet —

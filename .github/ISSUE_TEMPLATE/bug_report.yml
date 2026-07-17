@@ -1,0 +1,110 @@
+name: Bug report
+description: Report a reproducible problem in Dump.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Remove private notes, credentials, tokens, and personal file paths before submitting.
+
+        Security vulnerabilities belong in [private vulnerability reporting](https://github.com/myattj/dump/security/advisories/new), not here.
+
+  - type: input
+    id: dump-version
+    attributes:
+      label: Dump version
+      description: Find this at the bottom of the menu bar menu.
+      placeholder: "0.1.2"
+    validations:
+      required: true
+
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version
+      placeholder: "macOS 15.5"
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Mac model
+      description: Include the Apple chip and model if known.
+      placeholder: "MacBook Pro, M3 Pro"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation
+      options:
+        - Official DMG release
+        - Built from source
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Active provider
+      description: Choose the provider selected in Settings. Do not include credentials.
+      options:
+        - Anthropic API
+        - Claude Code
+        - Codex
+        - OpenAI-compatible
+        - Amazon Bedrock
+        - Ollama
+        - Not provider-related
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Use synthetic note content and the smallest reliable sequence.
+      placeholder: |
+        1. Open...
+        2. Enter...
+        3. Press...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Optional. Review logs before pasting. Remove note content, credentials, tokens, endpoint secrets, and personal paths.
+      placeholder: Paste the smallest relevant, redacted excerpt.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I reproduced this on the latest release or current main branch.
+          required: true
+        - label: I removed private content and credentials from this report.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

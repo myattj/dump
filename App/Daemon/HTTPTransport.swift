@@ -145,10 +145,9 @@ public struct HTTPTransport: HTTPTransporting {
                 durationMS: durationMS,
                 requestBytes: request.body?.count,
                 errorDomain: nsError.domain,
-                errorCode: nsError.code,
-                errorDescription: nsError.localizedDescription
+                errorCode: nsError.code
             ))
-            Self.log.error("http failed id=\(requestID, privacy: .public) method=\(request.method, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public) duration_ms=\(durationMS, privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public) error=\(nsError.localizedDescription, privacy: .public)")
+            Self.log.error("http failed id=\(requestID, privacy: .public) method=\(request.method, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public) duration_ms=\(durationMS, privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public) error=\(nsError.localizedDescription, privacy: .private)")
             throw error
         }
     }
@@ -188,7 +187,7 @@ public struct HTTPTransport: HTTPTransporting {
                     continuation.finish()
                 } catch {
                     let nsError = error as NSError
-                    Self.log.error("http stream failed id=\(requestID, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public) duration_ms=\(Self.durationMS(since: startedAt), privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public) error=\(nsError.localizedDescription, privacy: .public)")
+                    Self.log.error("http stream failed id=\(requestID, privacy: .public) url=\(diagnostics.redactedURL, privacy: .public) duration_ms=\(Self.durationMS(since: startedAt), privacy: .public) domain=\(nsError.domain, privacy: .public) code=\(nsError.code, privacy: .public) error=\(nsError.localizedDescription, privacy: .private)")
                     continuation.finish(throwing: error)
                 }
             }
@@ -205,12 +204,12 @@ public struct HTTPTransport: HTTPTransporting {
 
     private static func diagnostics(for request: HTTPRequest) -> RequestDiagnostics {
         let host = request.url.host ?? ""
-        let path = request.url.path.isEmpty ? "/" : request.url.path
+        let requestPath = request.url.path.isEmpty ? "/" : request.url.path
         return RequestDiagnostics(
             redactedURL: redactedURL(request.url),
             host: host,
-            path: path,
-            category: category(host: host, path: path)
+            path: "/<redacted>",
+            category: category(host: host, path: requestPath)
         )
     }
 
@@ -218,9 +217,7 @@ public struct HTTPTransport: HTTPTransporting {
         let scheme = url.scheme.map { "\($0)://" } ?? ""
         let host = url.host ?? ""
         let port = url.port.map { ":\($0)" } ?? ""
-        let path = url.path.isEmpty ? "/" : url.path
-        let query = url.query == nil ? "" : "?<redacted>"
-        return "\(scheme)\(host)\(port)\(path)\(query)"
+        return "\(scheme)\(host)\(port)/<redacted>"
     }
 
     private static func category(host: String, path: String) -> String {

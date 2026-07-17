@@ -152,8 +152,8 @@ private enum SigV4Signer {
         credentials: BedrockCredentials,
         date: Date
     ) throws -> [String: String] {
-        let amzDate = timestampFormatter.string(from: date)
-        let dateStamp = datestampFormatter.string(from: date)
+        let amzDate = timestampFormatter().string(from: date)
+        let dateStamp = datestampFormatter().string(from: date)
         let payloadHash = sha256Hex(body)
 
         var headers: [(String, String)] = [
@@ -229,21 +229,21 @@ private enum SigV4Signer {
         value.split(whereSeparator: { $0 == " " || $0 == "\t" }).joined(separator: " ")
     }
 
-    nonisolated(unsafe) private static let timestampFormatter: DateFormatter = {
+    private static func timestampFormatter() -> DateFormatter {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
         f.timeZone = TimeZone(secondsFromGMT: 0)
         f.locale = Locale(identifier: "en_US_POSIX")
         return f
-    }()
+    }
 
-    nonisolated(unsafe) private static let datestampFormatter: DateFormatter = {
+    private static func datestampFormatter() -> DateFormatter {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd"
         f.timeZone = TimeZone(secondsFromGMT: 0)
         f.locale = Locale(identifier: "en_US_POSIX")
         return f
-    }()
+    }
 }
 
 private extension JSONEncoder {

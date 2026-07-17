@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/myattj/dump/security/advisories/new
+    about: Send security reports privately. Do not include vulnerability details in a public issue.
+  - name: Privacy and data handling
+    url: https://github.com/myattj/dump/blob/main/PRIVACY.md
+    about: Read what Dump stores locally and what it sends to configured providers.

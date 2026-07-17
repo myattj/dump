@@ -201,4 +201,17 @@ final class SchedulerServiceTests: XCTestCase {
         XCTAssertTrue(raw.contains("completed_at:"))
         XCTAssertTrue(notif.cancelled.contains("n1"))
     }
+
+    func testCancelAllPendingClearsNotificationsBeforeStorageMove() async throws {
+        let notif = MockNotificationCenter()
+        try await notif.schedule(id: "old-1", title: "x", body: "x", fireAt: .distantFuture, userInfo: [:])
+        try await notif.schedule(id: "old-2", title: "x", body: "x", fireAt: .distantFuture, userInfo: [:])
+        let scheduler = SchedulerService(storage: storage, writer: MarkdownWriter(), notifications: notif)
+
+        await scheduler.cancelAllPending()
+        let pending = await notif.pending()
+
+        XCTAssertEqual(Set(notif.cancelled), ["old-1", "old-2"])
+        XCTAssertTrue(pending.isEmpty)
+    }
 }

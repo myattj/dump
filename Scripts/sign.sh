@@ -9,6 +9,7 @@ set -euo pipefail
 #   APP_PATH             absolute path to Dump.app
 # Optional env:
 #   ENTITLEMENTS         defaults to Resources/Dump.entitlements
+#   NODE_ENTITLEMENTS    defaults to Resources/Node.entitlements
 #   KEYCHAIN_PROFILE     if your signing identity lives in a custom keychain
 
 : "${DEVELOPER_ID:?DEVELOPER_ID must be set (e.g. 'Developer ID Application: Josh Myatt (TEAMID)')}"
@@ -16,6 +17,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ENTITLEMENTS="${ENTITLEMENTS:-$ROOT_DIR/Resources/Dump.entitlements}"
+NODE_ENTITLEMENTS="${NODE_ENTITLEMENTS:-$ROOT_DIR/Resources/Node.entitlements}"
 RUNTIME_INSIDE_APP="$APP_PATH/Contents/Resources/runtime"
 
 if [[ ! -d "$APP_PATH" ]]; then
@@ -42,7 +44,7 @@ codesign_one() {
 
 codesign_node() {
   local file="$1"
-  codesign_one "$file" --entitlements "$ENTITLEMENTS"
+  codesign_one "$file" --entitlements "$NODE_ENTITLEMENTS"
 }
 
 # Inside-out signing: force-sign every Mach-O binary in the runtime first, then

@@ -61,7 +61,7 @@ struct MenuBarIcon: View {
             showConfirmation = true
             revertTask?.cancel()
             revertTask = Task {
-                try? await Task.sleep(nanoseconds: 800_000_000)
+                try? await Task.sleep(for: .milliseconds(800))
                 guard !Task.isCancelled else { return }
                 showConfirmation = false
             }

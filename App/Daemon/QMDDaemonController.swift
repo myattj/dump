@@ -4,7 +4,7 @@ import OSLog
 /// Locally-running qmd search daemon. The app bundles Node + qmd at build
 /// time under `.app/Contents/Resources/runtime/`; this actor launches the
 /// process, holds the chosen port, handles health probes and restart, and
-/// reaps orphans from prior crashed runs.
+/// terminates only the process instance it launched.
 public actor QMDDaemonController {
     public struct Config: Sendable {
         public var runtimeDirectory: URL?
@@ -38,21 +38,25 @@ public actor QMDDaemonController {
     private let config: Config
     private let process: ProcessLaunching
     private let transport: HTTPTransporting
+    private let storage: StoragePreference
     private let log = Logger(subsystem: "com.joshmyatt.dump", category: "qmd")
 
     private var state: State = .stopped
     private var port: Int?
     private var ringBuffer: [String] = []
     private var restartAttempts = 0
+    private var launchGeneration: UInt = 0
 
     public init(
         config: Config = Config(),
         process: ProcessLaunching = SystemProcessLauncher(),
-        transport: HTTPTransporting = HTTPTransport()
+        transport: HTTPTransporting = HTTPTransport(),
+        storage: StoragePreference = .shared
     ) {
         self.config = config
         self.process = process
         self.transport = transport
+        self.storage = storage
     }
 
     public func currentState() -> State { state }
@@ -72,7 +76,7 @@ public actor QMDDaemonController {
     /// Environment passed to qmd CLI subprocesses so they read/write the same
     /// data directory as the long-running daemon.
     public func cliEnvironment() -> [String: String] {
-        ["QMD_DATA_DIR": StoragePreference.shared.root.path]
+        ["QMD_DATA_DIR": storage.root.path]
     }
 
     public func startIfNeeded() async {
@@ -81,18 +85,17 @@ public actor QMDDaemonController {
     }
 
     public func start() async {
-        await reapOrphans()
+        launchGeneration &+= 1
+        let generation = launchGeneration
         state = .starting
         let chosen = pickPort()
         port = chosen
         DiagnosticLog.event(.info, category: "qmd", "starting daemon", metadata: [
             "port": String(chosen),
-            "runtime": (config.runtimeDirectory ?? bundledRuntimeDirectory()).path,
-            "data_dir": StoragePreference.shared.root.path,
         ])
         let env = [
             "QMD_PORT": String(chosen),
-            "QMD_DATA_DIR": StoragePreference.shared.root.path,
+            "QMD_DATA_DIR": storage.root.path,
         ]
         do {
             try process.launch(
@@ -103,7 +106,7 @@ public actor QMDDaemonController {
                     Task { await self?.appendLog(line) }
                 },
                 onExit: { [weak self] code in
-                    Task { await self?.handleExit(code: code) }
+                    Task { await self?.handleExit(code: code, generation: generation) }
                 }
             )
             try await waitForHealth(port: chosen)
@@ -114,6 +117,8 @@ public actor QMDDaemonController {
                 "port": String(chosen),
             ])
         } catch {
+            launchGeneration &+= 1
+            process.terminate()
             state = .crashed(reason: String(describing: error))
             port = nil
             log.error("qmd start failed: \(String(describing: error), privacy: .public)")
@@ -128,6 +133,7 @@ public actor QMDDaemonController {
         DiagnosticLog.event(.info, category: "qmd", "stopping daemon", metadata: [
             "port": port.map(String.init) ?? "",
         ])
+        launchGeneration &+= 1
         process.terminate()
         state = .stopped
         port = nil
@@ -158,7 +164,8 @@ public actor QMDDaemonController {
         throw HealthError.timedOut
     }
 
-    private func handleExit(code: Int32) async {
+    private func handleExit(code: Int32, generation: UInt) async {
+        guard generation == launchGeneration else { return }
         if state == .stopped { return }
         ringBuffer.append("[exit] code=\(code)")
         DiagnosticLog.event(.warning, category: "qmd", "daemon exited", metadata: [
@@ -184,10 +191,6 @@ public actor QMDDaemonController {
         ringBuffer.append(line)
         if ringBuffer.count > 500 { ringBuffer.removeFirst(ringBuffer.count - 500) }
         DiagnosticLog.event(.debug, category: "qmd.process", line)
-    }
-
-    private func reapOrphans() async {
-        process.reapOrphans(named: "qmd")
     }
 
     private func pickPort() -> Int {

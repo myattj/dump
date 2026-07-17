@@ -74,16 +74,16 @@ public actor MCPClient: QMDClienting {
             let errPipe = Pipe()
             process.standardOutput = outPipe
             process.standardError = errPipe
+            let stdout = ProcessPipeCollector(pipe: outPipe)
+            let stderr = ProcessPipeCollector(pipe: errPipe)
 
             try process.run()
             process.waitUntilExit()
 
-            let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
             let output = QMDCLIOutput(
                 exitCode: process.terminationStatus,
-                stdout: String(data: outData, encoding: .utf8) ?? "",
-                stderr: String(data: errData, encoding: .utf8) ?? ""
+                stdout: String(data: stdout.finish(), encoding: .utf8) ?? "",
+                stderr: String(data: stderr.finish(), encoding: .utf8) ?? ""
             )
             if output.exitCode != 0 {
                 throw QMDClientError.cliFailed(exitCode: output.exitCode, stderr: output.stderr)

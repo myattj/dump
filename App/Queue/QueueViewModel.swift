@@ -198,10 +198,13 @@ public final class QueueViewModel: ObservableObject {
     }
 
     public func submit(now: Date = Date()) async {
-        let body = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let draft = input
+        let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return }
         let preview = resolvedPreview(for: body, now: now)
         let overridden = dateKindOverride != nil || !suppressedFields.isEmpty
+        let previousDateKindOverride = dateKindOverride
+        let previousSuppressedFields = suppressedFields
         input = ""
         dateKindOverride = nil
         suppressedFields = []
@@ -227,7 +230,17 @@ public final class QueueViewModel: ObservableObject {
                 await self?.classifyAndRefresh(url: result.url, body: body, now: now)
             }
         } catch {
-            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            if input.isEmpty {
+                input = draft
+                dateKindOverride = previousDateKindOverride
+                suppressedFields = previousSuppressedFields
+                self.error = message
+            } else {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(draft, forType: .string)
+                self.error = "\(message) The unsaved draft was copied to the clipboard."
+            }
         }
     }
 
@@ -312,7 +325,7 @@ public final class QueueViewModel: ObservableObject {
     /// leaves" so the beat is visible. Skipped under reduce motion.
     private func beatPause() async {
         guard !reduceMotion else { return }
-        try? await Task.sleep(nanoseconds: 140_000_000)
+        try? await Task.sleep(for: .milliseconds(140))
     }
 
     public func snoozeSelected(_ option: SnoozeOption) async {
@@ -420,7 +433,7 @@ public final class QueueViewModel: ObservableObject {
     private func scheduleToastDismissal(after seconds: TimeInterval) {
         toastDismissTask?.cancel()
         toastDismissTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
             self?.clearUndoToast()
         }

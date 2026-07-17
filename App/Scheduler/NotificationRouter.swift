@@ -10,11 +10,41 @@ import UserNotifications
 /// started the app are delivered.
 @MainActor
 public final class NotificationRouter: NSObject, UNUserNotificationCenterDelegate {
-    private weak var coordinator: AppCoordinator?
+    private let markDone: @MainActor (URL) async throws -> Void
+    private let snooze: @MainActor (URL) async throws -> Void
+    private let refreshQueueHandler: @MainActor () -> Void
+    private let revealQueueEntry: @MainActor (String?) -> Void
     private let log = Logger(subsystem: "com.joshmyatt.dump", category: "notifications")
 
-    public init(coordinator: AppCoordinator) {
-        self.coordinator = coordinator
+    public convenience init(coordinator: AppCoordinator) {
+        self.init(
+            markDone: { [weak coordinator] entryURL in
+                guard let coordinator else { return }
+                try await coordinator.scheduler.markDone(entryURL: entryURL)
+            },
+            snooze: { [weak coordinator] entryURL in
+                guard let coordinator else { return }
+                try await coordinator.scheduler.snoozeNotification(entryURL: entryURL)
+            },
+            refreshQueue: { [weak coordinator] in
+                coordinator?.queue.refresh()
+            },
+            revealQueueEntry: { [weak coordinator] entryID in
+                coordinator?.queue.reveal(id: entryID)
+            }
+        )
+    }
+
+    init(
+        markDone: @escaping @MainActor (URL) async throws -> Void,
+        snooze: @escaping @MainActor (URL) async throws -> Void,
+        refreshQueue: @escaping @MainActor () -> Void = {},
+        revealQueueEntry: @escaping @MainActor (String?) -> Void = { _ in }
+    ) {
+        self.markDone = markDone
+        self.snooze = snooze
+        self.refreshQueueHandler = refreshQueue
+        self.revealQueueEntry = revealQueueEntry
         super.init()
     }
 
@@ -63,33 +93,32 @@ public final class NotificationRouter: NSObject, UNUserNotificationCenterDelegat
         )
     }
 
-    private func handle(action: String, entryID: String?, path: String?) async {
-        guard let coordinator else { return }
+    func handle(action: String, entryID: String?, path: String?) async {
         switch action {
         case QueueNotification.doneAction:
             guard let path else { return }
             do {
-                try await coordinator.scheduler.snoozeNotification(entryURL: URL(fileURLWithPath: path))
-            } catch {
-                log.error("snooze from notification failed: \(String(describing: error), privacy: .public)")
-            }
-            coordinator.queue.refresh()
-        case QueueNotification.snoozeAction:
-            guard let path else { return }
-            do {
-                try await coordinator.scheduler.markDone(entryURL: URL(fileURLWithPath: path))
+                try await markDone(URL(fileURLWithPath: path))
             } catch {
                 log.error("mark done from notification failed: \(String(describing: error), privacy: .public)")
             }
-            coordinator.queue.refresh()
+            refreshQueue()
+        case QueueNotification.snoozeAction:
+            guard let path else { return }
+            do {
+                try await snooze(URL(fileURLWithPath: path))
+            } catch {
+                log.error("snooze from notification failed: \(String(describing: error), privacy: .public)")
+            }
+            refreshQueue()
         case UNNotificationDefaultActionIdentifier:
-            coordinator.queue.reveal(id: entryID)
+            revealQueueEntry(entryID)
         default:
             break
         }
     }
 
     private func refreshQueue() {
-        coordinator?.queue.refresh()
+        refreshQueueHandler()
     }
 }

@@ -1,0 +1,49 @@
+name: Feature request
+description: Propose a focused improvement to Dump.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the user problem. A concrete workflow is more useful than a broad solution pitch.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and where does the current experience fail?
+      placeholder: When I..., I need..., because...
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe what success would feel like without assuming an implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Optional. Include UI or technical ideas if you have them.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or other approaches have you tried?
+
+  - type: checkboxes
+    id: impact
+    attributes:
+      label: Impact checklist
+      options:
+        - label: This request does not require sending more user data to a third party.
+        - label: I described any new model, network, storage, or permission requirement above.
+        - label: I used synthetic examples and included no private note content.
+          required: true

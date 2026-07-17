@@ -561,7 +561,8 @@ enum PanelInputFocus {
     static func focus(in panel: NSPanel, attempts: Int = 8) {
         guard let target = findEditableTextInput(panel.contentView) else {
             guard attempts > 1 else { return }
-            DispatchQueue.main.async { [weak panel] in
+            Task { @MainActor [weak panel] in
+                await Task.yield()
                 guard let panel else { return }
                 focus(in: panel, attempts: attempts - 1)
             }

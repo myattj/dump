@@ -87,6 +87,9 @@ public struct ClaudeSynthesizer: Synthesizing {
         guard let key = keychain.string(for: .anthropicAPIKey), !key.isEmpty else {
             throw SynthesisError.missingAPIKey
         }
+        guard let endpoint = endpointOverride ?? configStore.anthropicMessagesURL() else {
+            throw SynthesisError.invalidEndpoint
+        }
         let prompt = Self.buildPrompt(query: query, hits: hits)
         let payload = MessagesRequest(
             model: model,
@@ -97,7 +100,7 @@ public struct ClaudeSynthesizer: Synthesizing {
         let body = try JSONEncoder.anthropic.encode(payload)
         let req = HTTPRequest(
             method: "POST",
-            url: endpointOverride ?? configStore.anthropicMessagesURL(),
+            url: endpoint,
             headers: [
                 "x-api-key": key,
                 "anthropic-version": "2023-06-01",
@@ -125,6 +128,9 @@ public struct ClaudeSynthesizer: Synthesizing {
                     guard let key = keychain.string(for: .anthropicAPIKey), !key.isEmpty else {
                         throw SynthesisError.missingAPIKey
                     }
+                    guard let endpoint = endpointOverride ?? configStore.anthropicMessagesURL() else {
+                        throw SynthesisError.invalidEndpoint
+                    }
                     let prompt = Self.buildPrompt(query: query, hits: hits)
                     let payload = MessagesRequest(
                         model: model,
@@ -136,7 +142,7 @@ public struct ClaudeSynthesizer: Synthesizing {
                     let body = try JSONEncoder.anthropic.encode(payload)
                     let req = HTTPRequest(
                         method: "POST",
-                        url: endpointOverride ?? configStore.anthropicMessagesURL(),
+                        url: endpoint,
                         headers: [
                             "x-api-key": key,
                             "anthropic-version": "2023-06-01",
@@ -208,6 +214,7 @@ public struct ClaudeSynthesizer: Synthesizing {
 
     public enum SynthesisError: Error, Equatable {
         case missingAPIKey
+        case invalidEndpoint
         case upstream(Int, String)
     }
 
@@ -249,6 +256,8 @@ extension ClaudeSynthesizer.SynthesisError: LocalizedError {
         switch self {
         case .missingAPIKey:
             "No Anthropic API key — add one in Settings → Classifier."
+        case .invalidEndpoint:
+            "The saved Anthropic endpoint is not a valid HTTPS URL. Update it in Settings → Classifier."
         case let .upstream(status, _):
             "Claude returned an error (HTTP \(status)). Try again in a moment."
         }

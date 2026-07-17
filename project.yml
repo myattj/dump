@@ -25,10 +25,10 @@ settings:
 packages:
   HotKey:
     url: https://github.com/soffes/HotKey
-    from: 0.2.0
+    exactVersion: 0.2.1
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
-    from: 2.6.0
+    exactVersion: 2.9.1
   Wave:
     url: https://github.com/jtrivedi/Wave
     exactVersion: 0.3.4
@@ -39,11 +39,12 @@ targets:
     platform: macOS
     sources:
       - path: App
-    resources:
       - path: Resources
         excludes:
           - Info.plist
           - Dump.entitlements
+          - Node.entitlements
+        buildPhase: resources
     preBuildScripts:
       - name: Fetch bundled Node + qmd runtime
         script: |
@@ -84,7 +85,8 @@ targets:
         LSUIElement: true
         LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
         CADisableMinimumFrameDuration: true
-        NSHumanReadableCopyright: ""
+        NSHumanReadableCopyright: Copyright © 2026 Joshua Myatt. All rights reserved.
+        LSApplicationCategoryType: public.app-category.productivity
         SUFeedURL: https://myattj.github.io/dump-updates/appcast.xml
         SUEnableInstallerLauncherService: true
         SUPublicEDKey: CSXW1L8m4x/hSs0Bh7OuArx/DnL3UWh6245lvVkhvZ4=
@@ -92,7 +94,6 @@ targets:
       path: Resources/Dump.entitlements
       properties:
         com.apple.security.app-sandbox: false
-        com.apple.security.cs.allow-jit: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.joshmyatt.dump

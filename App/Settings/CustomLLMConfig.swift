@@ -103,39 +103,86 @@ public final class CustomLLMConfigStore: @unchecked Sendable {
         set { defaults.set(newValue, forKey: DefaultsKey.codexExecutablePath) }
     }
 
-    /// Resolves the Anthropic Messages URL the Claude clients should hit:
-    /// either the user-supplied override (any of "https://host",
-    /// "https://host/v1", "https://host/v1/messages") or api.anthropic.com.
-    public func anthropicMessagesURL() -> URL {
-        let trimmed = anthropicEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    /// Resolves the Anthropic Messages URL the Claude clients should hit.
+    /// Overrides must use HTTPS so API keys and note contents are never sent
+    /// to a remote host in plaintext.
+    public func anthropicMessagesURL() -> URL? {
         let fallback = URL(string: "https://api.anthropic.com/v1/messages")!
-        guard !trimmed.isEmpty, let url = URL(string: trimmed) else { return fallback }
+        let configured = anthropicEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        if configured.isEmpty { return fallback }
+        guard let url = Self.secureRemoteURL(from: configured) else { return nil }
         let path = url.path
         if path.hasSuffix("/messages") { return url }
         if path.contains("/v") { return url.appendingPathComponent("messages") }
         return url.appendingPathComponent("v1/messages")
     }
 
-    /// Builds the `/chat/completions` URL from the user-supplied base. Accepts
-    /// "https://host", "https://host/v1", or "https://host/v1/chat/completions"
-    /// and normalizes to the right shape.
+    public func isValidAnthropicEndpoint(_ value: String) -> Bool {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || Self.secureRemoteURL(from: value) != nil
+    }
+
+    /// Builds the `/chat/completions` URL from a hosted HTTPS base.
     public func chatCompletionsURL() -> URL? {
-        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !trimmed.isEmpty, let url = URL(string: trimmed) else { return nil }
+        chatCompletionsURL(for: baseURL)
+    }
+
+    public func chatCompletionsURL(for value: String) -> URL? {
+        guard let url = Self.secureRemoteURL(from: value) else { return nil }
         let path = url.path
         if path.hasSuffix("/chat/completions") { return url }
         if path.contains("/v") { return url.appendingPathComponent("chat/completions") }
         return url.appendingPathComponent("v1/chat/completions")
     }
 
+    /// Ollama may use plaintext HTTP only on the local loopback interface.
     public func ollamaChatURL() -> URL {
-        let trimmed = ollamaBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let fallback = URL(string: "http://127.0.0.1:11434/api/chat")!
-        guard !trimmed.isEmpty, let url = URL(string: trimmed) else { return fallback }
+        guard let url = Self.ollamaURL(from: ollamaBaseURL) else { return fallback }
         if url.path.hasSuffix("/api/chat") { return url }
         return url.appendingPathComponent("api/chat")
+    }
+
+    private static func secureRemoteURL(from value: String) -> URL? {
+        guard let url = parsedURL(from: value), url.scheme?.lowercased() == "https" else {
+            return nil
+        }
+        return url
+    }
+
+    private static func ollamaURL(from value: String) -> URL? {
+        guard let url = parsedURL(from: value), let scheme = url.scheme?.lowercased() else {
+            return nil
+        }
+        if scheme == "https" { return url }
+        guard scheme == "http", let host = url.host?.lowercased(), isLoopback(host) else {
+            return nil
+        }
+        return url
+    }
+
+    private static func parsedURL(from value: String) -> URL? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let components = URLComponents(string: trimmed),
+              let scheme = components.scheme,
+              !scheme.isEmpty,
+              let host = components.host,
+              !host.isEmpty,
+              components.user == nil,
+              components.password == nil,
+              let url = components.url
+        else {
+            return nil
+        }
+        return url
+    }
+
+    private static func isLoopback(_ host: String) -> Bool {
+        if host == "localhost" || host.hasSuffix(".localhost") || host == "::1" {
+            return true
+        }
+        let octets = host.split(separator: ".")
+        return octets.count == 4 && octets.first == "127"
     }
 }

@@ -411,7 +411,7 @@ struct QueryView: View {
                 "Search archive",
                 text: $viewModel.query,
                 prompt: Text("Search or ask anything\u{2026}")
-                    .foregroundColor(Color.primary.opacity(0.45))
+                    .foregroundStyle(Color.primary.opacity(0.45))
             )
                 .textFieldStyle(.plain)
                 .font(DumpUI.Typography.input)
@@ -682,8 +682,8 @@ struct QueryView: View {
     /// header count and the row list, so they can't disagree.
     private var otherItems: [OtherItem] {
         var items: [OtherItem] = []
-        if viewModel.answer != nil, !viewModel.isAnswerSelected {
-            items.append(.answer(viewModel.answer!))
+        if let answer = viewModel.answer, !viewModel.isAnswerSelected {
+            items.append(.answer(answer))
         }
         for (idx, hit) in viewModel.hits.enumerated() {
             if viewModel.selectedHit?.id == hit.id { continue }
@@ -1645,15 +1645,21 @@ enum HitDisplay {
         s.range(of: #"^\d{4}-\d{2}-\d{2}-\d{4}"#, options: .regularExpression) != nil
     }
 
-    /// Turn "2026-05-18-1819-i-need-to-take-the-laundry.md" into
-    /// "I need to take the laundry". Falls back to the basename if no
-    /// timestamp prefix is present.
+    /// Turn a capture filename into a readable title, removing both its
+    /// timestamp prefix and the collision-proof ULID suffix. Legacy filenames
+    /// without the suffix remain supported.
     private static func slug(from file: String) -> String {
         let basename = (file as NSString).lastPathComponent
         let withoutExt = (basename as NSString).deletingPathExtension
         var s = withoutExt
         if let range = s.range(of: #"^\d{4}-\d{2}-\d{2}-\d{4}-"#, options: .regularExpression) {
             s = String(s[range.upperBound...])
+            if let idRange = s.range(
+                of: #"-[0-9A-HJKMNP-TV-Z]{26}$"#,
+                options: .regularExpression
+            ) {
+                s.removeSubrange(idRange)
+            }
         }
         s = s.replacingOccurrences(of: "-", with: " ")
         guard let first = s.first else { return withoutExt }

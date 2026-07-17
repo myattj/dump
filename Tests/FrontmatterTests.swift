@@ -54,6 +54,40 @@ final class FrontmatterTests: XCTestCase {
         XCTAssertEqual(decoded.tags, ["a", "b", "c"])
     }
 
+    func testTagsWithPunctuationAndEscapesRoundTrip() throws {
+        let tags = [
+            "research, later",
+            "say \"hello\"",
+            #"path\segment"#,
+            "line one\nline two",
+            "topic:swift",
+        ]
+        let fm = Frontmatter(
+            id: "01HXY",
+            createdAt: Date(timeIntervalSince1970: 0),
+            tags: tags
+        )
+
+        let encoded = FrontmatterCodec.encode(fm, body: "")
+        let (decoded, _) = try FrontmatterCodec.decode(encoded)
+
+        XCTAssertEqual(decoded.tags, tags)
+    }
+
+    func testLegacyUnquotedTagsStillDecode() throws {
+        let raw = """
+        ---
+        id: 01HXY
+        created_at: 1970-01-01T00:00:00Z
+        tags: [home, chores]
+        ---
+        """
+
+        let (decoded, _) = try FrontmatterCodec.decode(raw)
+
+        XCTAssertEqual(decoded.tags, ["home", "chores"])
+    }
+
     func testBackcompatLeavesQueueFieldsNil() throws {
         let raw = """
         ---

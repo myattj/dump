@@ -2,12 +2,10 @@ import Foundation
 import OSLog
 import Sparkle
 
-/// Thin wrapper around Sparkle. Built so a fresh checkout boots cleanly even
-/// when `SUFeedURL` / `SUPublicEDKey` still hold the placeholder values from
-/// `project.yml`. Sparkle's auto-startup is deferred until those Info.plist
-/// keys point at a real appcast + Ed25519 public key; otherwise we keep the
-/// updater constructed-but-stopped so the menu item stays callable without
-/// throwing a "The updater failed to start" alert at launch.
+/// Thin wrapper around Sparkle. Auto-startup is deferred until the Info.plist
+/// contains a usable appcast URL and Ed25519 public key; otherwise the updater
+/// remains constructed but stopped, avoiding a launch-time configuration
+/// alert while keeping the menu action safe to call.
 @MainActor
 public final class UpdateController: NSObject {
     private let controller: SPUStandardUpdaterController

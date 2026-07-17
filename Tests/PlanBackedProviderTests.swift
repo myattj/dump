@@ -15,7 +15,8 @@ final class PlanBackedCLIClientTests: XCTestCase {
         let invocation = try XCTUnwrap(runner.invocations.first)
         XCTAssertEqual(invocation.executable.path, "/tmp/claude")
         XCTAssertEqual(invocation.arguments.prefix(4), ["-p", "--output-format", "text", "--no-session-persistence"])
-        XCTAssertEqual(invocation.arguments.last, "hello")
+        XCTAssertFalse(invocation.arguments.contains("hello"))
+        XCTAssertEqual(invocation.standardInput, Data("hello".utf8))
         XCTAssertEqual(invocation.environment["ANTHROPIC_API_KEY"], "")
         XCTAssertEqual(invocation.environment["OPENAI_API_KEY"], "")
     }
@@ -35,6 +36,8 @@ final class PlanBackedCLIClientTests: XCTestCase {
         XCTAssertTrue(invocation.arguments.contains("--ephemeral"))
         XCTAssertTrue(invocation.arguments.contains("--skip-git-repo-check"))
         XCTAssertTrue(invocation.arguments.contains("--output-last-message"))
+        XCTAssertEqual(invocation.arguments.last, "-")
+        XCTAssertEqual(invocation.standardInput, Data("summarize".utf8))
         XCTAssertEqual(argument(after: "--sandbox", in: invocation.arguments), "read-only")
         XCTAssertEqual(invocation.environment["ANTHROPIC_API_KEY"], "")
         XCTAssertEqual(invocation.environment["OPENAI_API_KEY"], "")
@@ -128,6 +131,52 @@ final class PlanBackedConfigStoreTests: XCTestCase {
     }
 }
 
+final class SystemLocalPlanCommandRunnerTests: XCTestCase {
+    func testLargeStandardInputReachesChildWithoutUsingArguments() async throws {
+        let input = Data(repeating: 0x61, count: 1_048_576)
+        let result = try await SystemLocalPlanCommandRunner().run(
+            executable: URL(fileURLWithPath: "/usr/bin/wc"),
+            arguments: ["-c"],
+            environment: [:],
+            standardInput: input,
+            timeout: 5
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertEqual(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines), "1048576")
+    }
+
+    func testTimeoutIsEnforcedWhenChildNeverReadsStandardInput() async throws {
+        let started = ContinuousClock.now
+        let result = try await SystemLocalPlanCommandRunner().run(
+            executable: URL(fileURLWithPath: "/bin/sleep"),
+            arguments: ["5"],
+            environment: [:],
+            standardInput: Data(repeating: 0x61, count: 1_048_576),
+            timeout: 0.2
+        )
+        let elapsed = ContinuousClock.now - started
+
+        XCTAssertNotEqual(result.exitCode, 0)
+        XCTAssertLessThan(elapsed, .seconds(2))
+    }
+
+    func testDrainsLargeStdoutAndStderrWithoutDeadlock() async throws {
+        let script = "i=0; while [ $i -lt 5000 ]; do echo stdout-$i; echo stderr-$i >&2; i=$((i+1)); done"
+        let result = try await SystemLocalPlanCommandRunner().run(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", script],
+            environment: [:],
+            standardInput: nil,
+            timeout: 10
+        )
+
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertTrue(result.stdout.contains("stdout-4999"))
+        XCTAssertTrue(result.stderr.contains("stderr-4999"))
+    }
+}
+
 final class PlanBackedExecutableResolverTests: XCTestCase {
     func testDetectsExecutablesFromPathEnvironment() throws {
         let directory = try makeExecutableDirectory(commands: ["claude", "codex"])
@@ -193,6 +242,7 @@ private final class MockLocalPlanCommandRunner: LocalPlanCommandRunning, @unchec
         let executable: URL
         let arguments: [String]
         let environment: [String: String]
+        let standardInput: Data?
         let timeout: TimeInterval
     }
 
@@ -208,6 +258,7 @@ private final class MockLocalPlanCommandRunner: LocalPlanCommandRunning, @unchec
         executable: URL,
         arguments: [String],
         environment: [String: String],
+        standardInput: Data?,
         timeout: TimeInterval
     ) async throws -> LocalPlanCommandResult {
         lock.withLock {
@@ -215,6 +266,7 @@ private final class MockLocalPlanCommandRunner: LocalPlanCommandRunning, @unchec
                 executable: executable,
                 arguments: arguments,
                 environment: environment,
+                standardInput: standardInput,
                 timeout: timeout
             ))
         }

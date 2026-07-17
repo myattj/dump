@@ -134,7 +134,7 @@ extension CustomLLMClassifier.CustomLLMError: LocalizedError {
         case .missingAPIKey:
             "No API key for the custom endpoint — add one in Settings → Classifier."
         case .missingBaseURL:
-            "No base URL for the custom endpoint — set one in Settings → Classifier."
+            "The custom endpoint needs a valid HTTPS base URL in Settings → Classifier."
         case .missingModel:
             "No model name for the custom endpoint — set one in Settings → Classifier."
         case let .upstream(status, _):

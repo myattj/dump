@@ -9,6 +9,14 @@ final class HitDisplayTests: XCTestCase {
         XCTAssertEqual(HitDisplay.title(for: hit), "I need to take the laundry")
     }
 
+    func testTitleOmitsCollisionProofULIDSuffix() {
+        let hit = makeHit(
+            file: "inbox/2026-05-18-1819-i-need-to-take-the-laundry-01KRYX1PAPFMXW4A242AHQ9YWG.md",
+            title: nil
+        )
+        XCTAssertEqual(HitDisplay.title(for: hit), "I need to take the laundry")
+    }
+
     func testTitlePrefersFrontmatterTitleWhenItIsNotTheFilename() {
         let hit = makeHit(file: "inbox/2026-05-18-1819-foo.md", title: "Buy more dish soap")
         XCTAssertEqual(HitDisplay.title(for: hit), "Buy more dish soap")

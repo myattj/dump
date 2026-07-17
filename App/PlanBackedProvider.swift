@@ -83,6 +83,7 @@ public protocol LocalPlanCommandRunning: Sendable {
         executable: URL,
         arguments: [String],
         environment: [String: String],
+        standardInput: Data?,
         timeout: TimeInterval
     ) async throws -> LocalPlanCommandResult
 }
@@ -94,6 +95,7 @@ public final class SystemLocalPlanCommandRunner: LocalPlanCommandRunning, @unche
         executable: URL,
         arguments: [String],
         environment: [String: String],
+        standardInput: Data?,
         timeout: TimeInterval
     ) async throws -> LocalPlanCommandResult {
         try await Task.detached(priority: .utility) {
@@ -101,6 +103,7 @@ public final class SystemLocalPlanCommandRunner: LocalPlanCommandRunning, @unche
                 executable: executable,
                 arguments: arguments,
                 environment: environment,
+                standardInput: standardInput,
                 timeout: timeout
             )
         }.value
@@ -110,6 +113,7 @@ public final class SystemLocalPlanCommandRunner: LocalPlanCommandRunning, @unche
         executable: URL,
         arguments: [String],
         environment: [String: String],
+        standardInput: Data?,
         timeout: TimeInterval
     ) throws -> LocalPlanCommandResult {
         let process = Process()
@@ -121,10 +125,19 @@ public final class SystemLocalPlanCommandRunner: LocalPlanCommandRunning, @unche
         let stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
+        let stdoutCollector = ProcessPipeCollector(pipe: stdout)
+        let stderrCollector = ProcessPipeCollector(pipe: stderr)
 
-        try process.run()
+        // A pipe can block forever if the child launches but never reads
+        // stdin. Stage the prompt in an unlinked, mode-0600 temporary file
+        // instead: it never appears in argv or at a reusable filesystem path,
+        // and the child can read it without backpressure from the parent.
+        let inputHandle = try standardInput.map(Self.makeStandardInputHandle)
+        defer { try? inputHandle?.close() }
+        process.standardInput = inputHandle
 
         let deadline = Date().addingTimeInterval(timeout)
+        try process.run()
         while process.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.05)
         }
@@ -138,11 +151,9 @@ public final class SystemLocalPlanCommandRunner: LocalPlanCommandRunning, @unche
         }
         process.waitUntilExit()
 
-        let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
         return LocalPlanCommandResult(
-            stdout: String(data: stdoutData, encoding: .utf8) ?? "",
-            stderr: String(data: stderrData, encoding: .utf8) ?? "",
+            stdout: String(data: stdoutCollector.finish(), encoding: .utf8) ?? "",
+            stderr: String(data: stderrCollector.finish(), encoding: .utf8) ?? "",
             exitCode: process.terminationStatus
         )
     }
@@ -159,6 +170,35 @@ public final class SystemLocalPlanCommandRunner: LocalPlanCommandRunning, @unche
             environment[key] = value
         }
         return environment
+    }
+
+    private static func makeStandardInputHandle(_ data: Data) throws -> FileHandle {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dump-stdin-\(UUID().uuidString)")
+        guard FileManager.default.createFile(
+            atPath: url.path,
+            contents: nil,
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        do {
+            let handle = try FileHandle(forUpdating: url)
+            do {
+                try FileManager.default.removeItem(at: url)
+                try handle.write(contentsOf: data)
+                try handle.seek(toOffset: 0)
+                return handle
+            } catch {
+                try? handle.close()
+                try? FileManager.default.removeItem(at: url)
+                throw error
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
+        }
     }
 }
 
@@ -287,9 +327,9 @@ public struct PlanBackedCLIClient: Sendable {
                 "--output-format", "text",
                 "--no-session-persistence",
                 "--max-turns", "1",
-                prompt,
             ],
             environment: planBackedEnvironment,
+            standardInput: Data(prompt.utf8),
             timeout: timeout
         )
         guard result.exitCode == 0 else {
@@ -317,9 +357,10 @@ public struct PlanBackedCLIClient: Sendable {
                 "--sandbox", "read-only",
                 "--color", "never",
                 "--output-last-message", outputURL.path,
-                prompt,
+                "-",
             ],
             environment: planBackedEnvironment,
+            standardInput: Data(prompt.utf8),
             timeout: timeout
         )
         guard result.exitCode == 0 else {

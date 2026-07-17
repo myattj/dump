@@ -28,9 +28,45 @@ final class MarkdownWriterTests: XCTestCase {
     }
 
     func testFilenameUsesSlugFromBody() throws {
-        let writer = MarkdownWriter()
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let writer = MarkdownWriter(clock: { now })
         let result = try writer.write(body: "Pick up dry cleaning later today", into: tempDir)
-        XCTAssertTrue(result.url.lastPathComponent.contains("pick-up-dry-cleaning"))
+        XCTAssertNotNil(
+            result.url.lastPathComponent.range(
+                of: #"^\d{4}-\d{2}-\d{2}-\d{4}-pick-up-dry-cleaning-later-today-"#,
+                options: .regularExpression
+            )
+        )
+        XCTAssertTrue(result.url.lastPathComponent.hasSuffix("-\(result.frontmatter.id).md"))
+    }
+
+    func testIdenticalWritesInSameMinuteCreateDistinctFilesWithoutLosingContent() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let writer = MarkdownWriter(clock: { now })
+        let body = "Pick up dry cleaning later today"
+
+        let first = try writer.write(body: body, into: tempDir)
+        let second = try writer.write(body: body, into: tempDir)
+
+        XCTAssertNotEqual(first.frontmatter.id, second.frontmatter.id)
+        XCTAssertNotEqual(first.url, second.url)
+
+        let files = try FileManager.default.contentsOfDirectory(
+            at: tempDir,
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertEqual(
+            Set(files.map(\.lastPathComponent)),
+            Set([first.url.lastPathComponent, second.url.lastPathComponent])
+        )
+
+        for result in [first, second] {
+            let raw = try String(contentsOf: result.url, encoding: .utf8)
+            let (frontmatter, storedBody) = try FrontmatterCodec.decode(raw)
+            XCTAssertEqual(frontmatter.id, result.frontmatter.id)
+            XCTAssertEqual(storedBody, body)
+            XCTAssertTrue(result.url.lastPathComponent.contains(result.frontmatter.id))
+        }
     }
 
     func testSlugFallsBackToIDWhenBodyIsBlank() throws {

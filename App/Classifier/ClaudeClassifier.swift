@@ -30,6 +30,9 @@ public struct ClaudeClassifier: Classifier {
         guard let key = keychain.string(for: .anthropicAPIKey), !key.isEmpty else {
             throw ClassifierError.missingAPIKey
         }
+        guard let endpoint = endpointOverride ?? configStore.anthropicMessagesURL() else {
+            throw ClassifierError.invalidEndpoint
+        }
         let payload = MessagesRequest(
             model: model,
             maxTokens: 256,
@@ -41,7 +44,7 @@ public struct ClaudeClassifier: Classifier {
         let body = try JSONEncoder.anthropic.encode(payload)
         let req = HTTPRequest(
             method: "POST",
-            url: endpointOverride ?? configStore.anthropicMessagesURL(),
+            url: endpoint,
             headers: [
                 "x-api-key": key,
                 "anthropic-version": "2023-06-01",
@@ -99,6 +102,7 @@ public struct ClaudeClassifier: Classifier {
 
     public enum ClassifierError: Error, Equatable {
         case missingAPIKey
+        case invalidEndpoint
         case upstream(Int, String)
         case malformed
     }

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Verify Apple silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Validate shell scripts
+        run: bash -n Scripts/*.sh
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Fetch pinned runtime
+        run: ./Scripts/fetch-runtime.sh
+
+      - name: Audit runtime dependencies
+        working-directory: Runtime/qmd
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Build and test
+        run: xcodebuild -project Dump.xcodeproj -scheme Dump -derivedDataPath "$RUNNER_TEMP/DumpDerivedData" -destination 'platform=macOS,arch=arm64' CODE_SIGNING_ALLOWED=NO test

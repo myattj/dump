@@ -13,8 +13,6 @@ public protocol ProcessLaunching: Sendable {
     ) throws
 
     func terminate()
-
-    func reapOrphans(named name: String)
 }
 
 public final class SystemProcessLauncher: ProcessLaunching, @unchecked Sendable {
@@ -60,21 +58,21 @@ public final class SystemProcessLauncher: ProcessLaunching, @unchecked Sendable 
     }
 
     public func terminate() {
-        process?.terminate()
+        guard let process else { return }
         pipe?.fileHandleForReading.readabilityHandler = nil
-        process = nil
-        pipe = nil
-    }
-
-    public func reapOrphans(named name: String) {
-        // Best-effort: find prior qmd processes for this user and SIGTERM them.
-        // We deliberately keep this conservative — only match basename to avoid
-        // killing unrelated `node` processes.
-        let task = Process()
-        task.launchPath = "/usr/bin/pkill"
-        task.arguments = ["-f", "@tobilu/qmd/dist/cli/qmd.js"]
-        try? task.run()
-        task.waitUntilExit()
+        if process.isRunning {
+            process.terminate()
+            let deadline = Date().addingTimeInterval(1)
+            while process.isRunning && Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            if process.isRunning {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+            process.waitUntilExit()
+        }
+        self.process = nil
+        self.pipe = nil
     }
 
     public static func isPortFree(_ port: Int) -> Bool {
@@ -94,5 +92,39 @@ public final class SystemProcessLauncher: ProcessLaunching, @unchecked Sendable 
             }
         }
         return result == 0
+    }
+}
+
+/// Drains a subprocess pipe while it is running so a full stdout/stderr buffer
+/// cannot deadlock the child before `waitUntilExit()` returns.
+final class ProcessPipeCollector: @unchecked Sendable {
+    private let handle: FileHandle
+    private let lock = NSLock()
+    private var buffer = Data()
+
+    init(pipe: Pipe) {
+        handle = pipe.fileHandleForReading
+        handle.readabilityHandler = { [weak self] readable in
+            self?.consumeAvailableData(from: readable)
+        }
+    }
+
+    func finish() -> Data {
+        handle.readabilityHandler = nil
+        return lock.withLock {
+            buffer.append(handle.readDataToEndOfFile())
+            return buffer
+        }
+    }
+
+    private func consumeAvailableData(from readable: FileHandle) {
+        lock.withLock {
+            let chunk = readable.availableData
+            if chunk.isEmpty {
+                readable.readabilityHandler = nil
+            } else {
+                buffer.append(chunk)
+            }
+        }
     }
 }

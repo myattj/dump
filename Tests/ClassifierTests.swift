@@ -63,6 +63,28 @@ final class ClaudeClassifierTests: XCTestCase {
             XCTFail("wrong error: \(error)")
         }
     }
+
+    func testInvalidSavedEndpointFailsClosedWithoutSendingCapture() async throws {
+        let keychain = InMemoryKeychain()
+        try keychain.set("k", for: .anthropicAPIKey)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "claude-endpoint-\(UUID().uuidString)"))
+        let config = CustomLLMConfigStore(defaults: defaults)
+        config.anthropicEndpoint = "http://legacy-proxy.example.com"
+        let transport = MockHTTPTransport()
+        let classifier = ClaudeClassifier(
+            keychain: keychain.asKeychainStore(),
+            transport: transport,
+            configStore: config
+        )
+
+        do {
+            _ = try await classifier.classify("private capture", now: Date())
+            XCTFail("expected invalidEndpoint")
+        } catch let error as ClaudeClassifier.ClassifierError {
+            XCTAssertEqual(error, .invalidEndpoint)
+        }
+        XCTAssertTrue(transport.sentRequests.isEmpty)
+    }
 }
 
 final class OllamaClassifierTests: XCTestCase {

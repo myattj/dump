@@ -354,19 +354,45 @@ final class ClassifierHubCustomRoutingTests: XCTestCase {
 final class CustomLLMConfigStoreTests: XCTestCase {
     func testAnthropicMessagesURLDefaultsToAnthropic() {
         let store = CustomLLMConfigStore(defaults: UserDefaults(suiteName: "cfg-\(UUID().uuidString)")!)
-        XCTAssertEqual(store.anthropicMessagesURL().absoluteString, "https://api.anthropic.com/v1/messages")
+        XCTAssertEqual(store.anthropicMessagesURL()?.absoluteString, "https://api.anthropic.com/v1/messages")
     }
 
     func testAnthropicMessagesURLAppendsV1Messages() {
         let store = CustomLLMConfigStore(defaults: UserDefaults(suiteName: "cfg-\(UUID().uuidString)")!)
         store.anthropicEndpoint = "https://proxy.example.com"
-        XCTAssertEqual(store.anthropicMessagesURL().absoluteString, "https://proxy.example.com/v1/messages")
+        XCTAssertEqual(store.anthropicMessagesURL()?.absoluteString, "https://proxy.example.com/v1/messages")
     }
 
     func testAnthropicMessagesURLHonoursExistingPath() {
         let store = CustomLLMConfigStore(defaults: UserDefaults(suiteName: "cfg-\(UUID().uuidString)")!)
         store.anthropicEndpoint = "https://proxy.example.com/v1/messages"
-        XCTAssertEqual(store.anthropicMessagesURL().absoluteString, "https://proxy.example.com/v1/messages")
+        XCTAssertEqual(store.anthropicMessagesURL()?.absoluteString, "https://proxy.example.com/v1/messages")
+    }
+
+    func testAnthropicMessagesURLRejectsInsecureOrMalformedOverrides() {
+        let store = CustomLLMConfigStore(defaults: UserDefaults(suiteName: "cfg-\(UUID().uuidString)")!)
+        for endpoint in [
+            "http://proxy.example.com",
+            "file:///tmp/messages",
+            "https:///missing-host",
+            "https://user:password@proxy.example.com",
+        ] {
+            store.anthropicEndpoint = endpoint
+            XCTAssertFalse(store.isValidAnthropicEndpoint(endpoint))
+            XCTAssertNil(store.anthropicMessagesURL())
+        }
+    }
+
+    func testChatCompletionsURLRequiresHostedHTTPS() {
+        let store = CustomLLMConfigStore(defaults: UserDefaults(suiteName: "cfg-\(UUID().uuidString)")!)
+        XCTAssertEqual(
+            store.chatCompletionsURL(for: "https://gateway.example.com/v1")?.absoluteString,
+            "https://gateway.example.com/v1/chat/completions"
+        )
+        XCTAssertNil(store.chatCompletionsURL(for: "http://gateway.example.com/v1"))
+        XCTAssertNil(store.chatCompletionsURL(for: "http://localhost:8080/v1"))
+        XCTAssertNil(store.chatCompletionsURL(for: "file:///tmp/gateway"))
+        XCTAssertNil(store.chatCompletionsURL(for: "gateway.example.com/v1"))
     }
 
     func testOllamaChatURLDefaultsAndNormalizesBaseURL() {
@@ -374,6 +400,18 @@ final class CustomLLMConfigStoreTests: XCTestCase {
         XCTAssertEqual(store.ollamaChatURL().absoluteString, "http://127.0.0.1:11434/api/chat")
         store.ollamaBaseURL = "http://localhost:11434/"
         XCTAssertEqual(store.ollamaChatURL().absoluteString, "http://localhost:11434/api/chat")
+    }
+
+    func testOllamaAllowsLoopbackHTTPAndRejectsRemoteHTTP() {
+        let store = CustomLLMConfigStore(defaults: UserDefaults(suiteName: "cfg-\(UUID().uuidString)")!)
+        store.ollamaBaseURL = "http://127.0.0.2:11434"
+        XCTAssertEqual(store.ollamaChatURL().absoluteString, "http://127.0.0.2:11434/api/chat")
+
+        store.ollamaBaseURL = "http://ollama.example.com:11434"
+        XCTAssertEqual(store.ollamaChatURL().absoluteString, "http://127.0.0.1:11434/api/chat")
+
+        store.ollamaBaseURL = "https://ollama.example.com"
+        XCTAssertEqual(store.ollamaChatURL().absoluteString, "https://ollama.example.com/api/chat")
     }
 }
 

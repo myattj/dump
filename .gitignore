@@ -17,6 +17,7 @@ Package.resolved
 # Generated runtime artifacts (Phase 1+)
 Runtime/node/
 Runtime/qmd/node_modules/
+Runtime/.work/
 
 # macOS
 .DS_Store
@@ -27,3 +28,19 @@ Runtime/qmd/node_modules/
 # Coverage
 *.profraw
 *.profdata
+
+# Local developer and agent tooling
+.agents/
+.claude/
+skills-lock.json
+
+# Local configuration and signing credentials
+.env
+.env.*
+!.env.example
+*.p8
+*.p12
+*.pfx
+*.pem
+*.key
+*.mobileprovision

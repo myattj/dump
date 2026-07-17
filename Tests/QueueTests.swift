@@ -518,6 +518,18 @@ final class QueueViewModelSelectionTests: XCTestCase {
         XCTAssertEqual(viewModel.selectedID, "first")
     }
 
+    func testSubmitRestoresDraftWhenWriteFails() async throws {
+        let inbox = storage.subdirectory(.inbox)
+        try FileManager.default.removeItem(at: inbox)
+        XCTAssertTrue(FileManager.default.createFile(atPath: inbox.path, contents: Data()))
+        viewModel.input = "  keep this task  "
+
+        await viewModel.submit(now: Date(timeIntervalSince1970: 1_800_000_000))
+
+        XCTAssertEqual(viewModel.input, "  keep this task  ")
+        XCTAssertNotNil(viewModel.error)
+    }
+
     @discardableResult
     private func writeTask(
         id: String,

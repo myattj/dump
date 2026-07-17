@@ -1,7 +1,7 @@
 import Foundation
 
-/// Writes captured entries to disk as `<timestamp>-<slug>.md` with YAML
-/// frontmatter. Pure I/O — classification happens after the write returns.
+/// Writes captured entries to disk as `<timestamp>-<slug>-<ulid>.md` with
+/// YAML frontmatter. Pure I/O — classification happens after the write returns.
 public struct MarkdownWriter: Sendable {
     public struct WriteResult: Sendable, Equatable {
         public let url: URL
@@ -31,11 +31,10 @@ public struct MarkdownWriter: Sendable {
         )
         seedFrontmatter?(&fm)
 
-        let slug = (slugHint ?? Self.slug(from: body, fallback: fm.id)).isEmpty
-            ? fm.id
-            : (slugHint ?? Self.slug(from: body, fallback: fm.id))
+        let suggestedSlug = slugHint ?? Self.slug(from: body, fallback: fm.id)
+        let slug = suggestedSlug.isEmpty ? fm.id : suggestedSlug
 
-        let filename = "\(Self.timestampFormatter.string(from: now))-\(slug).md"
+        let filename = "\(Self.timestampFormatter.string(from: now))-\(slug)-\(fm.id).md"
         let url = directory.appendingPathComponent(filename)
 
         let contents = FrontmatterCodec.encode(fm, body: body)

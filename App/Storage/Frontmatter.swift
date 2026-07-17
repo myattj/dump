@@ -113,7 +113,7 @@ public enum FrontmatterCodec {
         lines.append("created_at: \(iso.string(from: fm.createdAt))")
         if let s = fm.scheduledAt { lines.append("scheduled_at: \(iso.string(from: s))") }
         lines.append("status: \(fm.status.rawValue)")
-        lines.append("tags: [\(fm.tags.map { escape($0) }.joined(separator: ", "))]")
+        lines.append("tags: \(encodeInlineArray(fm.tags))")
         if let n = fm.notificationId { lines.append("notification_id: \(n)") }
         lines.append("source: \(fm.source.rawValue)")
         if let c = fm.classifier { lines.append("classifier: \(c)") }
@@ -217,7 +217,23 @@ public enum FrontmatterCodec {
         return inner.replacingOccurrences(of: "\\\"", with: "\"")
     }
 
+    /// JSON arrays are valid YAML flow sequences and give us correct escaping
+    /// for commas, quotes, backslashes, and newlines without a YAML dependency.
+    private static func encodeInlineArray(_ values: [String]) -> String {
+        guard let data = try? JSONEncoder().encode(values),
+              let encoded = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return encoded
+    }
+
     private static func parseInlineArray(_ s: String) -> [String] {
+        if let data = s.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            return decoded
+        }
+
+        // Backward compatibility for unquoted arrays written by older builds.
         var trimmed = s.trimmingCharacters(in: .whitespaces)
         guard trimmed.hasPrefix("["), trimmed.hasSuffix("]") else { return [] }
         trimmed.removeFirst()

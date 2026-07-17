@@ -25,6 +25,7 @@ public final class AppCoordinator: ObservableObject {
     private var hotkeyPreferenceObserver: AnyCancellable?
     private var wakeObserver: NSObjectProtocol?
     private var dayChangeObserver: NSObjectProtocol?
+    private var storageTransitionGeneration: UInt = 0
 
     public init(
         storage: StoragePreference = .shared,
@@ -35,7 +36,7 @@ public final class AppCoordinator: ObservableObject {
         self.storage = storage
         let writer = MarkdownWriter()
         self.writer = writer
-        let daemon = QMDDaemonController()
+        let daemon = QMDDaemonController(storage: storage)
         self.daemon = daemon
         let classifierHub = ClassifierHub(
             keychain: keychain,
@@ -86,7 +87,6 @@ public final class AppCoordinator: ObservableObject {
         DiagnosticLog.prepare()
         DiagnosticLog.event(.info, category: "app", "starting Dump", metadata: [
             "version": Bundle.main.shortVersion,
-            "storage": storage.root.path,
             "classifier_mode": ClassifierModePreference.read(from: .standard).rawValue,
         ])
         registerHotkeys()
@@ -170,36 +170,66 @@ public final class AppCoordinator: ObservableObject {
         }
     }
 
-    /// Registers `inbox/`, `meetings/`, `pdfs/` as qmd collections so the
-    /// query engine can find captures. Idempotent — skips any name already
-    /// known to qmd. Triggers a one-shot update+embed if anything got added.
-    private func bootstrapCollections() async {
+    /// Registers built-in capture folders and saved code folders as qmd
+    /// collections. Idempotent unless a storage-root change requests a full
+    /// rebind. Triggers one update+embed pass if anything was added.
+    private func bootstrapCollections(forceRebind: Bool = false) async {
         let engine = QueryEngine(daemon: daemon)
         let existing = (try? await engine.collectionNames()) ?? []
         let known = Set(existing)
-        let entries: [(name: String, subdir: StoragePreference.Subdir, glob: String)] = [
-            ("inbox", .inbox, "**/*.md"),
-            ("meetings", .meetings, "**/*.md"),
-            ("pdfs", .pdfs, "**/*.md"),
+        var entries: [(name: String, root: URL, glob: String, createDirectory: Bool)] = [
+            ("inbox", storage.subdirectory(.inbox), "**/*.md", true),
+            ("meetings", storage.subdirectory(.meetings), "**/*.md", true),
+            ("pdfs", storage.subdirectory(.pdfs), "**/*.md", true),
         ]
+        let savedCodeCollections = await CodeCollectionStore(engine: engine).list()
+        entries.append(contentsOf: savedCodeCollections.map { collection in
+            (
+                name: "code-\(collection.id)",
+                root: URL(fileURLWithPath: collection.rootPath, isDirectory: true),
+                glob: collection.glob,
+                createDirectory: false
+            )
+        })
         var added = false
-        for entry in entries where !known.contains(entry.name) {
-            let dir = storage.subdirectory(entry.subdir)
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for entry in entries {
+            if known.contains(entry.name) {
+                guard forceRebind else { continue }
+                do {
+                    try await engine.removeCollection(name: entry.name)
+                } catch {
+                    logger.error("failed to remove stale \(entry.name, privacy: .public) collection: \(String(describing: error), privacy: .public)")
+                    DiagnosticLog.event(.error, category: "qmd", "failed to remove stale collection", metadata: [
+                        "name": entry.name,
+                        "error": String(describing: error),
+                    ])
+                    continue
+                }
+            }
+            if entry.createDirectory {
+                try? FileManager.default.createDirectory(at: entry.root, withIntermediateDirectories: true)
+            } else {
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: entry.root.path, isDirectory: &isDirectory),
+                      isDirectory.boolValue else {
+                    DiagnosticLog.event(.warning, category: "qmd", "saved collection folder unavailable", metadata: [
+                        "name": entry.name,
+                    ])
+                    continue
+                }
+            }
             do {
-                try await engine.addCollection(name: entry.name, root: dir, glob: entry.glob)
+                try await engine.addCollection(name: entry.name, root: entry.root, glob: entry.glob)
                 added = true
-                logger.info("registered qmd collection \(entry.name, privacy: .public) -> \(dir.path, privacy: .public)")
+                logger.info("registered qmd collection \(entry.name, privacy: .public)")
                 DiagnosticLog.event(.info, category: "qmd", "registered collection", metadata: [
                     "name": entry.name,
-                    "path": dir.path,
                     "glob": entry.glob,
                 ])
             } catch {
                 logger.error("failed to register \(entry.name, privacy: .public): \(String(describing: error), privacy: .public)")
                 DiagnosticLog.event(.error, category: "qmd", "failed to register collection", metadata: [
                     "name": entry.name,
-                    "path": dir.path,
                     "error": String(describing: error),
                 ])
             }
@@ -218,6 +248,7 @@ public final class AppCoordinator: ObservableObject {
         hotkeyPreferenceObserver = nil
         heartbeat?.cancel()
         heartbeat = nil
+        storageTransitionGeneration &+= 1
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
             self.wakeObserver = nil
@@ -227,5 +258,34 @@ public final class AppCoordinator: ObservableObject {
             self.dayChangeObserver = nil
         }
         Task { await daemon.stop() }
+    }
+
+    public func setStorageRoot(_ url: URL) {
+        transitionStorageRoot(to: url)
+    }
+
+    public func resetStorageRoot() {
+        transitionStorageRoot(to: nil)
+    }
+
+    private func transitionStorageRoot(to url: URL?) {
+        storageTransitionGeneration &+= 1
+        let generation = storageTransitionGeneration
+        Task { [weak self] in
+            guard let self else { return }
+            await self.scheduler.cancelAllPending()
+            guard generation == self.storageTransitionGeneration else { return }
+            if let url {
+                self.storage.setRoot(url)
+            } else {
+                self.storage.reset()
+            }
+            DiagnosticLog.event(.info, category: "storage", "storage root changed")
+            await self.daemon.restart()
+            guard generation == self.storageTransitionGeneration else { return }
+            await self.bootstrapCollections(forceRebind: true)
+            _ = await self.scheduler.reconcile()
+            self.queue.refresh()
+        }
     }
 }

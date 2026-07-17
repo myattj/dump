@@ -70,8 +70,7 @@ public enum DiagnosticLog {
     public static let subsystem = "com.joshmyatt.dump"
 
     public static var logsDirectory: URL {
-        FileManager.default
-            .urls(for: .libraryDirectory, in: .userDomainMask).first!
+        URL.libraryDirectory
             .appendingPathComponent("Logs/Dump", isDirectory: true)
     }
 

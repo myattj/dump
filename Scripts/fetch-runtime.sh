@@ -8,10 +8,10 @@ set -euo pipefail
 # packaging simple: single-arch tarball, no lipo dance.
 #
 # Idempotent: skips work when the expected pinned output already exists.
-# Force a refetch by deleting Runtime/node or Runtime/qmd.
+# Force a refetch by deleting Runtime/node or Runtime/qmd/node_modules.
 
-NODE_VERSION="${NODE_VERSION:-22.16.0}"
-QMD_VERSION="${QMD_VERSION:-2.1.0}"
+NODE_VERSION="22.16.0"
+QMD_VERSION="2.1.0"
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUNTIME_DIR="$ROOT_DIR/Runtime"
@@ -68,10 +68,14 @@ install_qmd() {
       return
     fi
     log "replacing qmd $installed with $QMD_VERSION"
-    rm -rf "$QMD_DIR"
+    rm -rf "$QMD_DIR/node_modules"
   fi
 
   mkdir -p "$QMD_DIR"
+  if [[ ! -f "$QMD_DIR/package-lock.json" ]]; then
+    echo "fetch-runtime: Runtime/qmd/package-lock.json is required; restore it from git" >&2
+    exit 1
+  fi
   cat > "$QMD_DIR/package.json" <<JSON
 {
   "name": "dump-runtime-qmd",
@@ -82,11 +86,11 @@ install_qmd() {
 }
 JSON
 
-  log "npm install @tobilu/qmd@${QMD_VERSION} (this compiles native modules; takes a minute)"
+  log "npm ci for @tobilu/qmd@${QMD_VERSION} (this compiles native modules; takes a minute)"
   (
     cd "$QMD_DIR"
     # Use the bundled Node so native modules link against the same ABI we ship.
-    PATH="$NODE_DIR/bin:$PATH" npm install \
+    PATH="$NODE_DIR/bin:$PATH" npm ci \
         --omit=dev --include=optional \
         --cpu=arm64 --os=darwin \
         --no-audit --no-fund --loglevel=error

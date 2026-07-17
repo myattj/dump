@@ -12,9 +12,8 @@ public final class MockProcessLauncher: ProcessLaunching, @unchecked Sendable {
     private struct State: @unchecked Sendable {
         var launched: [Launched] = []
         var terminateCalls = 0
-        var orphansReaped: [String] = []
         var lineHandler: (@Sendable (String) -> Void)?
-        var exitHandler: (@Sendable (Int32) -> Void)?
+        var exitHandlers: [(@Sendable (Int32) -> Void)] = []
         var launchError: Error?
     }
 
@@ -24,7 +23,6 @@ public final class MockProcessLauncher: ProcessLaunching, @unchecked Sendable {
 
     public var launched: [Launched] { state.withLock { $0.launched } }
     public var terminateCalls: Int { state.withLock { $0.terminateCalls } }
-    public var orphansReaped: [String] { state.withLock { $0.orphansReaped } }
 
     public func setLaunchError(_ error: Error?) {
         state.withLock { $0.launchError = error }
@@ -41,7 +39,7 @@ public final class MockProcessLauncher: ProcessLaunching, @unchecked Sendable {
             if let e = s.launchError { return e }
             s.launched.append(Launched(executable: executable, arguments: arguments, environment: environment))
             s.lineHandler = onLine
-            s.exitHandler = onExit
+            s.exitHandlers.append(onExit)
             return nil
         }
         if let e = throwable { throw e }
@@ -51,12 +49,15 @@ public final class MockProcessLauncher: ProcessLaunching, @unchecked Sendable {
         state.withLock { $0.terminateCalls += 1 }
     }
 
-    public func reapOrphans(named name: String) {
-        state.withLock { $0.orphansReaped.append(name) }
+    public func simulateExit(code: Int32) {
+        let handler = state.withLock { $0.exitHandlers.last }
+        handler?(code)
     }
 
-    public func simulateExit(code: Int32) {
-        let handler = state.withLock { $0.exitHandler }
+    public func simulateExit(code: Int32, launchIndex: Int) {
+        let handler = state.withLock { state in
+            state.exitHandlers.indices.contains(launchIndex) ? state.exitHandlers[launchIndex] : nil
+        }
         handler?(code)
     }
 

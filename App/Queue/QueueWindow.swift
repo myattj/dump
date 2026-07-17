@@ -305,7 +305,7 @@ struct QueueView: View {
                     "Queue item",
                     text: $viewModel.input,
                     prompt: Text("send invoice tomorrow 15m")
-                        .foregroundColor(Color.primary.opacity(0.42))
+                        .foregroundStyle(Color.primary.opacity(0.42))
                 )
                 .textFieldStyle(.plain)
                 .font(DumpUI.Typography.input)
@@ -806,6 +806,16 @@ private struct QueueRow: View {
         )
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .onTapGesture { viewModel.selectedID = item.id }
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction(named: "Select") {
+            viewModel.selectedID = item.id
+        }
+        .accessibilityAction(named: "Complete") {
+            Task { await viewModel.complete(item) }
+        }
+        .accessibilityAction(named: "Snooze until tomorrow") {
+            Task { await viewModel.snooze(item, .tomorrow) }
+        }
         .onHover { hovering in
             isHovering = hovering
         }

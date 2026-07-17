@@ -114,6 +114,14 @@ public actor SchedulerService {
         }
     }
 
+    /// Clears every pending request owned by Dump. Used before changing the
+    /// storage root so notifications cannot retain paths into the old root.
+    public func cancelAllPending() async {
+        let ids = Array(await notifications.pending())
+        guard !ids.isEmpty else { return }
+        await notifications.cancel(ids: ids)
+    }
+
     public struct Outcome: Equatable, Sendable {
         public let scheduled: [String]
         public let cancelled: [String]

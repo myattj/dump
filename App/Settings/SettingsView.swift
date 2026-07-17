@@ -56,7 +56,7 @@ struct SettingsView: View {
 
     var body: some View {
         TabView {
-            GeneralSettingsView(storage: coordinator.storage,
+            GeneralSettingsView(coordinator: coordinator,
                                  hotkeys: coordinator.hotkeyPreferences,
                                  hotkeyManager: coordinator.hotkeys)
                 .tabItem { Label("General", systemImage: "gearshape") }
@@ -73,24 +73,28 @@ struct SettingsView: View {
 }
 
 struct GeneralSettingsView: View {
-    let storage: StoragePreference
+    let coordinator: AppCoordinator
     @ObservedObject var hotkeys: HotkeyPreferenceStore
     let hotkeyManager: HotkeyManager
     @State private var path: String = ""
     @State private var recordingAction: HotkeyManager.Action?
     @State private var hotkeyMessage: String?
 
+    private var storage: StoragePreference { coordinator.storage }
+
     var body: some View {
         Form {
             Section("Storage") {
                 HStack {
                     LabeledContent("Storage directory") {
-                        TextField("Storage directory", text: $path)
-                            .labelsHidden()
+                        Text(path)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
                     }
                     Button("Choose…") { pickFolder() }
                     Button("Reset") {
-                        storage.reset()
+                        coordinator.resetStorageRoot()
                         path = storage.root.path
                     }
                 }
@@ -196,7 +200,7 @@ struct GeneralSettingsView: View {
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
-            storage.setRoot(url)
+            coordinator.setStorageRoot(url)
             path = url.path
         }
     }
@@ -218,11 +222,13 @@ private struct HotkeyCaptureView: NSViewRepresentable {
         nsView.onKeyDown = onKeyDown
         nsView.onCancel = onCancel
         if isActive {
-            DispatchQueue.main.async {
+            Task { @MainActor in
+                await Task.yield()
                 nsView.window?.makeFirstResponder(nsView)
             }
         } else if nsView.window?.firstResponder === nsView {
-            DispatchQueue.main.async {
+            Task { @MainActor in
+                await Task.yield()
                 nsView.window?.makeFirstResponder(nil)
             }
         }
@@ -347,6 +353,10 @@ struct ClassifierSettingsView: View {
                     Text("Override to route Claude through a corporate HTTPS proxy that speaks the Anthropic protocol. Leave blank for the default.")
                         .font(.caption).foregroundStyle(.secondary)
                     Button("Save endpoint") {
+                        guard configStore.isValidAnthropicEndpoint(anthropicEndpoint) else {
+                            flash("Use an HTTPS endpoint URL", success: false)
+                            return
+                        }
                         configStore.anthropicEndpoint = anthropicEndpoint
                         flash("Saved")
                     }
@@ -451,6 +461,10 @@ struct ClassifierSettingsView: View {
                             .labelsHidden()
                     }
                     Button("Save OpenAI-compatible settings") {
+                        guard configStore.chatCompletionsURL(for: customBaseURL) != nil else {
+                            flash("Use a valid HTTPS base URL", success: false)
+                            return
+                        }
                         configStore.baseURL = customBaseURL
                         configStore.classifierModel = customClassifierModel
                         configStore.synthesizerModel = customSynthesizerModel
@@ -575,7 +589,7 @@ struct ClassifierSettingsView: View {
             savedFlash = FlashMessage(text: msg, isSuccess: success)
         }
         flashTask = Task {
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            try? await Task.sleep(for: .seconds(1.5))
             guard !Task.isCancelled else { return }
             withAnimation(resolved(Motion.exit, reduceMotion: reduceMotion)) {
                 savedFlash = nil
