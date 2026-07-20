@@ -140,8 +140,11 @@ public final class QueueViewModel: ObservableObject {
     private let classifier: ClassifierHub
     private let scheduler: SchedulerService
     private let store: QueueStore
+    private let indexUpdater: QueueIndexUpdater?
     private var toastDismissTask: Task<Void, Never>?
     private var isToastHeld = false
+    private var isStopping = false
+    private var classificationTasks: [UUID: Task<Void, Never>] = [:]
 
     private var reduceMotion: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -152,13 +155,15 @@ public final class QueueViewModel: ObservableObject {
         writer: MarkdownWriter,
         classifier: ClassifierHub,
         scheduler: SchedulerService,
-        store: QueueStore
+        store: QueueStore,
+        queryEngine: QueryEngine? = nil
     ) {
         self.storage = storage
         self.writer = writer
         self.classifier = classifier
         self.scheduler = scheduler
         self.store = store
+        self.indexUpdater = queryEngine.map { QueueIndexUpdater(engine: $0) }
     }
 
     public func refresh(now: Date = Date()) async {
@@ -173,6 +178,29 @@ public final class QueueViewModel: ObservableObject {
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    public func refreshAfterExternalMutation(now: Date = Date()) async {
+        await refresh(now: now)
+        await requestIndexing()
+    }
+
+    public func stopIndexing() async {
+        await indexUpdater?.shutdown()
+    }
+
+    /// Terminal shutdown used by AppCoordinator. It prevents a UI submit
+    /// already in progress from registering late provider work, then cancels
+    /// and joins every classification plus the coalesced qmd updater.
+    public func stop() async {
+        isStopping = true
+        toastDismissTask?.cancel()
+        toastDismissTask = nil
+        let tasks = Array(classificationTasks.values)
+        for task in tasks { task.cancel() }
+        await indexUpdater?.shutdown()
+        for task in tasks { await task.value }
+        classificationTasks.removeAll()
     }
 
     /// What submit() will write for the current input, chip overrides applied.
@@ -198,6 +226,7 @@ public final class QueueViewModel: ObservableObject {
     }
 
     public func submit(now: Date = Date()) async {
+        guard !isStopping else { return }
         let draft = input
         let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return }
@@ -226,9 +255,8 @@ public final class QueueViewModel: ObservableObject {
                 }
             }
             await refresh(now: now)
-            Task { [weak self] in
-                await self?.classifyAndRefresh(url: result.url, body: body, now: now)
-            }
+            await requestIndexing()
+            startClassification(url: result.url, body: body, now: now)
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             if input.isEmpty {
@@ -300,6 +328,7 @@ public final class QueueViewModel: ObservableObject {
             await beat
             presentUndoToast(UndoToast(title: item.title, kind: .completed, record: undo))
             await refresh()
+            await requestIndexing()
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -316,6 +345,7 @@ public final class QueueViewModel: ObservableObject {
             await beat
             presentUndoToast(UndoToast(title: item.title, kind: .snoozed(until: until), record: undo))
             await refresh(now: now)
+            await requestIndexing()
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -337,6 +367,7 @@ public final class QueueViewModel: ObservableObject {
         do {
             try await store.wake(item)
             await refresh()
+            await requestIndexing()
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -381,6 +412,7 @@ public final class QueueViewModel: ObservableObject {
             try await store.editMetadata(item, mutate: mutate)
             _ = await scheduler.reconcile()
             await refresh()
+            await requestIndexing()
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -392,6 +424,7 @@ public final class QueueViewModel: ObservableObject {
             try await store.undo(undoToast.record)
             clearUndoToast()
             await refresh()
+            await requestIndexing()
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
@@ -450,8 +483,12 @@ public final class QueueViewModel: ObservableObject {
 
     private func classifyAndRefresh(url: URL, body: String, now: Date) async {
         let result = await classifier.classify(body, now: now)
+        // ClassifierHub deliberately maps backend failures to `.unknown`, so
+        // cancellation remains visible only through the task flag.
+        guard !Task.isCancelled, !isStopping else { return }
         let metadata = QueueMetadataExtractor.extract(from: body, now: now)
         let activeIdentifier = await classifier.activeIdentifier
+        guard !Task.isCancelled, !isStopping else { return }
         do {
             try await store.applyClassification(at: url) { fm in
                 let userEdited = fm.metadataEdited == true
@@ -477,10 +514,23 @@ public final class QueueViewModel: ObservableObject {
                 fm.metadataConfidence = result.metadataConfidence ?? fm.metadataConfidence
                 fm.classifier = activeIdentifier
             }
+            guard !Task.isCancelled, !isStopping else { return }
             _ = await scheduler.reconcile()
+            guard !Task.isCancelled, !isStopping else { return }
             await refresh()
+            await requestIndexing()
         } catch {
             self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    private func startClassification(url: URL, body: String, now: Date) {
+        guard !isStopping else { return }
+        let id = UUID()
+        classificationTasks[id] = Task { [weak self] in
+            guard let self else { return }
+            defer { self.classificationTasks.removeValue(forKey: id) }
+            await self.classifyAndRefresh(url: url, body: body, now: now)
         }
     }
 
@@ -489,5 +539,119 @@ public final class QueueViewModel: ObservableObject {
         if !items.contains(where: { $0.id == selectedID }) {
             self.selectedID = nil
         }
+    }
+
+    private func requestIndexing() async {
+        guard let indexUpdater else { return }
+        await indexUpdater.requestUpdate()
+    }
+}
+
+/// Coalesces bursts of queue writes without delaying the queue interaction
+/// that caused them. A request arriving during an active update schedules one
+/// more pass afterward; transient update and embed failures get bounded,
+/// independent retries without blocking the queue UI.
+private actor QueueIndexUpdater {
+    private enum Operation: String {
+        case update, embed
+    }
+
+    private let engine: QueryEngine
+    private let debounce: Duration
+    private let retryDelays: [Duration]
+    private var requestGeneration: UInt = 0
+    private var worker: Task<Void, Never>?
+    private var isShuttingDown = false
+
+    init(
+        engine: QueryEngine,
+        debounce: Duration = .milliseconds(150),
+        retryDelays: [Duration] = [.milliseconds(250), .seconds(1)]
+    ) {
+        self.engine = engine
+        self.debounce = debounce
+        self.retryDelays = retryDelays
+    }
+
+    func requestUpdate() {
+        guard !isShuttingDown else { return }
+        requestGeneration &+= 1
+        guard worker == nil else { return }
+        worker = Task { [weak self] in
+            await self?.drainRequests()
+        }
+    }
+
+    func shutdown() async {
+        isShuttingDown = true
+        guard let worker else { return }
+        worker.cancel()
+        await worker.value
+        self.worker = nil
+    }
+
+    private func drainRequests() async {
+        defer { worker = nil }
+        while !Task.isCancelled {
+            let generation = requestGeneration
+            do {
+                try await Task.sleep(for: debounce)
+            } catch {
+                break
+            }
+            guard generation == requestGeneration else { continue }
+
+            do {
+                let updated = try await runWithRetry(.update)
+                if updated {
+                    try Task.checkCancellation()
+                    _ = try await runWithRetry(.embed)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                DiagnosticLog.event(.error, category: "qmd", "queue index worker failed", metadata: [
+                    "error": String(describing: error),
+                ])
+            }
+
+            if generation == requestGeneration { break }
+        }
+    }
+
+    /// qmd updates can fail transiently while another CLI process is closing
+    /// SQLite or while a local model is becoming available. Retry each phase
+    /// independently: a failed embed must not throw away a successful lexical
+    /// update, and shutdown cancellation must remain immediate.
+    private func runWithRetry(_ operation: Operation) async throws -> Bool {
+        for attempt in 0...retryDelays.count {
+            try Task.checkCancellation()
+            do {
+                switch operation {
+                case .update:
+                    try await engine.updateIndex()
+                case .embed:
+                    try await engine.embed()
+                }
+                return true
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let willRetry = attempt < retryDelays.count
+                DiagnosticLog.event(
+                    willRetry ? .warning : .error,
+                    category: "qmd",
+                    "queue index \(operation.rawValue) failed",
+                    metadata: [
+                        "attempt": String(attempt + 1),
+                        "error": String(describing: error),
+                        "retrying": String(willRetry),
+                    ]
+                )
+                guard willRetry else { return false }
+                try await Task.sleep(for: retryDelays[attempt])
+            }
+        }
+        return false
     }
 }

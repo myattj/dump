@@ -13,6 +13,7 @@ public final class NotificationRouter: NSObject, UNUserNotificationCenterDelegat
     private let markDone: @MainActor (URL) async throws -> Void
     private let snooze: @MainActor (URL) async throws -> Void
     private let refreshQueueHandler: @MainActor () -> Void
+    private let queueDidMutateHandler: @MainActor () -> Void
     private let revealQueueEntry: @MainActor (String?) -> Void
     private let log = Logger(subsystem: "com.joshmyatt.dump", category: "notifications")
 
@@ -29,6 +30,9 @@ public final class NotificationRouter: NSObject, UNUserNotificationCenterDelegat
             refreshQueue: { [weak coordinator] in
                 coordinator?.queue.refresh()
             },
+            queueDidMutate: { [weak coordinator] in
+                coordinator?.queue.refreshAfterExternalMutation()
+            },
             revealQueueEntry: { [weak coordinator] entryID in
                 coordinator?.queue.reveal(id: entryID)
             }
@@ -39,11 +43,13 @@ public final class NotificationRouter: NSObject, UNUserNotificationCenterDelegat
         markDone: @escaping @MainActor (URL) async throws -> Void,
         snooze: @escaping @MainActor (URL) async throws -> Void,
         refreshQueue: @escaping @MainActor () -> Void = {},
+        queueDidMutate: @escaping @MainActor () -> Void = {},
         revealQueueEntry: @escaping @MainActor (String?) -> Void = { _ in }
     ) {
         self.markDone = markDone
         self.snooze = snooze
         self.refreshQueueHandler = refreshQueue
+        self.queueDidMutateHandler = queueDidMutate
         self.revealQueueEntry = revealQueueEntry
         super.init()
     }
@@ -99,18 +105,20 @@ public final class NotificationRouter: NSObject, UNUserNotificationCenterDelegat
             guard let path else { return }
             do {
                 try await markDone(URL(fileURLWithPath: path))
+                queueDidMutateHandler()
             } catch {
                 log.error("mark done from notification failed: \(String(describing: error), privacy: .public)")
+                refreshQueue()
             }
-            refreshQueue()
         case QueueNotification.snoozeAction:
             guard let path else { return }
             do {
                 try await snooze(URL(fileURLWithPath: path))
+                queueDidMutateHandler()
             } catch {
                 log.error("snooze from notification failed: \(String(describing: error), privacy: .public)")
+                refreshQueue()
             }
-            refreshQueue()
         case UNNotificationDefaultActionIdentifier:
             revealQueueEntry(entryID)
         default:

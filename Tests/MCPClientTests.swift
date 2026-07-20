@@ -72,6 +72,99 @@ final class MCPClientTests: XCTestCase {
         XCTAssertEqual(arguments?["rerank"] as? Bool, true)
     }
 
+    func testModelBackedQueryGetsExtendedTimeoutWithoutBroadeningOtherMCPRequests() async throws {
+        let transport = MockHTTPTransport()
+        let queryAttempts = OSAllocatedUnfairLock(initialState: 0)
+        transport.setFallback { req in
+            if req.url.path == "/health" {
+                return HTTPResponse(status: 200)
+            }
+            guard req.url.path == "/mcp",
+                  let body = req.body,
+                  let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let method = object["method"] as? String else {
+                return HTTPResponse(status: 404)
+            }
+
+            if method == "initialize" {
+                return HTTPResponse(
+                    status: 200,
+                    headers: ["Mcp-Session-Id": "sid-timeout"],
+                    body: Data("{\"result\":{}}".utf8)
+                )
+            }
+            if method == "notifications/initialized" {
+                return HTTPResponse(status: 200, body: Data("{\"result\":{}}".utf8))
+            }
+
+            let params = object["params"] as? [String: Any]
+            let tool = params?["name"] as? String
+            let structuredContent: [String: Any]
+            switch tool {
+            case "query":
+                let attempt = queryAttempts.withLock { count in
+                    count += 1
+                    return count
+                }
+                if attempt == 1 {
+                    return HTTPResponse(status: 404)
+                }
+                structuredContent = ["results": []]
+            case "status":
+                structuredContent = [
+                    "totalDocuments": 0,
+                    "needsEmbedding": 0,
+                    "hasVectorIndex": false,
+                    "collections": [],
+                ]
+            default:
+                return HTTPResponse(status: 404)
+            }
+            let response: [String: Any] = [
+                "result": [
+                    "content": [],
+                    "structuredContent": structuredContent,
+                ],
+            ]
+            return HTTPResponse(
+                status: 200,
+                body: try! JSONSerialization.data(withJSONObject: response)
+            )
+        }
+
+        let daemon = QMDDaemonController(
+            process: MockProcessLauncher(),
+            transport: transport
+        )
+        await daemon.start()
+        let client = MCPClient(daemon: daemon, transport: transport)
+
+        _ = try await client.query(QMDQuery(
+            searches: [QMDSearchTerm(type: .vec, query: "cold model")],
+            rerank: true
+        ))
+        _ = try await client.status()
+
+        let calls = transport.sentRequests.compactMap { request -> (method: String, tool: String?, timeout: TimeInterval)? in
+            guard request.url.path == "/mcp",
+                  let body = request.body,
+                  let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let method = object["method"] as? String else {
+                return nil
+            }
+            let params = object["params"] as? [String: Any]
+            return (method, params?["name"] as? String, request.timeout)
+        }
+
+        XCTAssertEqual(calls.filter { $0.method == "initialize" }.map(\.timeout), [30, 30])
+        XCTAssertEqual(calls.filter { $0.method == "notifications/initialized" }.map(\.timeout), [30, 30])
+        XCTAssertEqual(
+            calls.filter { $0.tool == "query" }.map(\.timeout),
+            [TimeInterval(10 * 60), TimeInterval(10 * 60)]
+        )
+        XCTAssertEqual(calls.filter { $0.tool == "status" }.map(\.timeout), [30])
+    }
+
     func testCLIProcessCancellationTerminatesOwnedProcess() async throws {
         let runner = QMDCLIProcessRunner(
             executable: URL(fileURLWithPath: "/bin/sleep"),

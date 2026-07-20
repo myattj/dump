@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Sparkle update verification key is public by design"
+condition = "AND"
+regexTarget = "line"
+paths = [
+  '''(^|/)project\.yml$''',
+  '''(^|/)Resources/Info\.plist$''',
+]
+regexes = [
+  '''CSXW1L8m4x/hSs0Bh7OuArx/DnL3UWh6245lvVkhvZ4=''',
+]

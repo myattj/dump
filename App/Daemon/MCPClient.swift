@@ -10,16 +10,24 @@ import OSLog
 /// session per-port so it survives across requests; if the daemon restarts
 /// on a new port (or the cached session 404s) we re-initialize transparently.
 public actor MCPClient: QMDClienting {
+    private static let standardRequestTimeout: TimeInterval = 30
+
     private let daemon: QMDDaemonController
     private let transport: HTTPTransporting
+    private let modelBackedQueryTimeout: TimeInterval
     private let log = Logger(subsystem: "com.joshmyatt.dump", category: "mcp")
 
     private var sessionPort: Int?
     private var sessionID: String?
 
-    public init(daemon: QMDDaemonController, transport: HTTPTransporting = HTTPTransport()) {
+    public init(
+        daemon: QMDDaemonController,
+        transport: HTTPTransporting = HTTPTransport(),
+        modelBackedQueryTimeout: TimeInterval = 10 * 60
+    ) {
         self.daemon = daemon
         self.transport = transport
+        self.modelBackedQueryTimeout = modelBackedQueryTimeout
     }
 
     // MARK: - QMDClienting
@@ -58,16 +66,7 @@ public actor MCPClient: QMDClienting {
     }
 
     public func runCLI(arguments: [String]) async throws -> QMDCLIOutput {
-        let node = await daemon.nodeExecutableURL()
-        let script = await daemon.qmdCLIScriptURL()
-        let env = await daemon.cliEnvironment()
-        var fullEnv = ProcessInfo.processInfo.environment
-        for (key, value) in env { fullEnv[key] = value }
-        return try await QMDCLIProcessRunner(
-            executable: node,
-            arguments: [script.path] + arguments,
-            environment: fullEnv
-        ).run()
+        try await daemon.runCLI(arguments: arguments)
     }
 
     // MARK: - MCP plumbing
@@ -79,6 +78,13 @@ public actor MCPClient: QMDClienting {
 
     private func call(tool: String, arguments: [String: AnyEncodable]) async throws -> CallEnvelope {
         guard let port = await daemon.currentPort() else { throw QMDClientError.daemonUnavailable }
+        // qmd's query tool lazily downloads and loads its embedding/reranking
+        // models. A cold first query can legitimately exceed the short budget
+        // used by metadata-only MCP operations. Task cancellation still tears
+        // down the URLSession request when the query window closes or reruns.
+        let requestTimeout = tool == "query"
+            ? modelBackedQueryTimeout
+            : Self.standardRequestTimeout
         DiagnosticLog.event(.debug, category: "mcp", "calling qmd tool", metadata: [
             "tool": tool,
             "port": String(port),
@@ -97,7 +103,12 @@ public actor MCPClient: QMDClienting {
                     "arguments": argsAny,
                 ]
             )
-            let resp = try await postMCP(port: port, body: body, expectSession: true)
+            let resp = try await postMCP(
+                port: port,
+                body: body,
+                expectSession: true,
+                timeout: requestTimeout
+            )
             // qmd may invalidate the cached session if it restarted; one retry is fine.
             if resp.status == 404 || resp.status == 400 {
                 DiagnosticLog.event(.warning, category: "mcp", "cached session rejected", metadata: [
@@ -107,7 +118,12 @@ public actor MCPClient: QMDClienting {
                 ])
                 sessionID = nil
                 try await ensureSession(port: port)
-                let retried = try await postMCP(port: port, body: body, expectSession: true)
+                let retried = try await postMCP(
+                    port: port,
+                    body: body,
+                    expectSession: true,
+                    timeout: requestTimeout
+                )
                 let envelope = try parseEnvelope(retried)
                 DiagnosticLog.event(.debug, category: "mcp", "qmd tool completed after retry", metadata: [
                     "tool": tool,
@@ -147,7 +163,12 @@ public actor MCPClient: QMDClienting {
                 ],
             ]
         )
-        let initResp = try await postMCP(port: port, body: body, expectSession: false)
+        let initResp = try await postMCP(
+            port: port,
+            body: body,
+            expectSession: false,
+            timeout: Self.standardRequestTimeout
+        )
         guard (200..<300).contains(initResp.status) else {
             throw QMDClientError.mcpError(code: initResp.status, message: String(data: initResp.body, encoding: .utf8) ?? "")
         }
@@ -158,7 +179,12 @@ public actor MCPClient: QMDClienting {
 
         // MCP requires the client to send notifications/initialized after init.
         let notifyBody = try jsonRPCRaw(method: "notifications/initialized", params: nil, includeID: false)
-        _ = try await postMCP(port: port, body: notifyBody, expectSession: true)
+        _ = try await postMCP(
+            port: port,
+            body: notifyBody,
+            expectSession: true,
+            timeout: Self.standardRequestTimeout
+        )
         log.debug("mcp session \(sid, privacy: .public) on port \(port, privacy: .public)")
         DiagnosticLog.event(.debug, category: "mcp", "initialized session", metadata: [
             "port": String(port),
@@ -166,7 +192,12 @@ public actor MCPClient: QMDClienting {
         ])
     }
 
-    private func postMCP(port: Int, body: Data, expectSession: Bool) async throws -> HTTPResponse {
+    private func postMCP(
+        port: Int,
+        body: Data,
+        expectSession: Bool,
+        timeout: TimeInterval
+    ) async throws -> HTTPResponse {
         let url = URL(string: "http://localhost:\(port)/mcp")!
         var headers: [String: String] = [
             "Content-Type": "application/json",
@@ -175,7 +206,13 @@ public actor MCPClient: QMDClienting {
         if expectSession, let sid = sessionID {
             headers["Mcp-Session-Id"] = sid
         }
-        return try await transport.send(HTTPRequest(method: "POST", url: url, headers: headers, body: body, timeout: 30))
+        return try await transport.send(HTTPRequest(
+            method: "POST",
+            url: url,
+            headers: headers,
+            body: body,
+            timeout: timeout
+        ))
     }
 
     private func parseEnvelope(_ resp: HTTPResponse) throws -> CallEnvelope {

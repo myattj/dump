@@ -6,6 +6,7 @@ public final class QueueCoordinator {
     private let writer: MarkdownWriter
     private let classifier: ClassifierHub
     private let scheduler: SchedulerService
+    private let queryEngine: QueryEngine?
 
     public private(set) lazy var store = QueueStore(
         storage: storage,
@@ -18,7 +19,8 @@ public final class QueueCoordinator {
         writer: writer,
         classifier: classifier,
         scheduler: scheduler,
-        store: store
+        store: store,
+        queryEngine: queryEngine
     )
 
     public private(set) lazy var window = QueueWindowController(viewModel: viewModel)
@@ -27,12 +29,14 @@ public final class QueueCoordinator {
         storage: StoragePreference,
         writer: MarkdownWriter,
         classifier: ClassifierHub,
-        scheduler: SchedulerService
+        scheduler: SchedulerService,
+        queryEngine: QueryEngine? = nil
     ) {
         self.storage = storage
         self.writer = writer
         self.classifier = classifier
         self.scheduler = scheduler
+        self.queryEngine = queryEngine
     }
 
     public func show() {
@@ -52,5 +56,18 @@ public final class QueueCoordinator {
 
     public func refresh() {
         Task { await viewModel.refresh() }
+    }
+
+    /// Reconciles queue UI after a mutation performed outside QueueViewModel
+    /// (for example, a notification action) and pushes the changed markdown
+    /// into qmd just like an in-window queue action.
+    public func refreshAfterExternalMutation() {
+        Task { await viewModel.refreshAfterExternalMutation() }
+    }
+
+    /// Cancels and joins queue-triggered classifier and qmd work before the
+    /// app tears down their process owners.
+    public func stop() async {
+        await viewModel.stop()
     }
 }

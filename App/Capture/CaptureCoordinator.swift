@@ -22,16 +22,18 @@ public final class CaptureCoordinator: ObservableObject {
     private let pdfImporter: PDFImporter
     private let onQueueChanged: @MainActor @Sendable () -> Void
     private let log = Logger(subsystem: "com.joshmyatt.dump", category: "capture")
+    private var acceptsSubmissions = true
+    private var submissionTasks: [UUID: Task<Void, Never>] = [:]
 
     public private(set) lazy var quickWindow: CaptureWindowController = {
         CaptureWindowController { [weak self] body in
-            await self?.handleSubmission(body: body, source: .capture)
+            self?.enqueueSubmission(body: body, source: .capture)
         }
     }()
 
     public private(set) lazy var meetingWindow: CaptureWindowController = {
         CaptureWindowController(positionKey: "dump.capture.meeting.origin") { [weak self] body in
-            await self?.handleSubmission(body: body, source: .meeting)
+            self?.enqueueSubmission(body: body, source: .meeting)
         }
     }()
 
@@ -57,6 +59,19 @@ public final class CaptureCoordinator: ObservableObject {
     public func showQuick() { quickWindow.toggle() }
     public func showMeeting() { meetingWindow.toggle() }
 
+    /// Registers the work synchronously with the coordinator before the
+    /// capture event returns. That closes the quit race where an untracked
+    /// task could launch a provider CLI after shutdown took its snapshot.
+    func enqueueSubmission(body: String, source: Frontmatter.Source) {
+        guard acceptsSubmissions else { return }
+        let id = UUID()
+        submissionTasks[id] = Task { [weak self] in
+            guard let self else { return }
+            defer { self.submissionTasks.removeValue(forKey: id) }
+            await self.handleSubmission(body: body, source: source)
+        }
+    }
+
     public func handleSubmission(body: String, source: Frontmatter.Source) async {
         let dir = storage.subdirectory(source == .meeting ? .meetings : .inbox)
         do {
@@ -73,7 +88,12 @@ public final class CaptureCoordinator: ObservableObject {
                 }
             }.value
             captureTick += 1
+            // A quit must never sacrifice the durable markdown write. Once
+            // it is safely on disk, cancellation skips all optional model,
+            // scheduler, and qmd work.
+            guard !Task.isCancelled else { return }
             await classifyAndPersist(at: result.url, body: body, source: source)
+            guard !Task.isCancelled else { return }
             // The queue scans frontmatter on disk (QueueStore.scanInbox) — it needs
             // nothing from the qmd index or the scheduler. Refresh it as soon as the
             // classified entry is durable, not after the qmd update/embed CLI runs.
@@ -81,6 +101,7 @@ public final class CaptureCoordinator: ObservableObject {
                 onQueueChanged()
             }
             await scheduler.reconcile()
+            guard !Task.isCancelled else { return }
             await indexUpdated(source: source)
         } catch {
             log.error("capture write failed: \(String(describing: error), privacy: .public)")
@@ -100,6 +121,7 @@ public final class CaptureCoordinator: ObservableObject {
     private func classifyAndPersist(at url: URL, body: String, source: Frontmatter.Source) async {
         guard source != .meeting else { return }
         let result = await classifier.classify(body)
+        guard !Task.isCancelled else { return }
         let metadata = QueueMetadataExtractor.extract(from: body)
         do {
             let raw = try String(contentsOf: url, encoding: .utf8)
@@ -130,6 +152,17 @@ public final class CaptureCoordinator: ObservableObject {
         _ = source
         try? await queryEngine.updateIndex()
         try? await queryEngine.embed()
+    }
+
+    /// Stops accepting captures, cancels their optional post-write work, and
+    /// joins every submission before application termination. A submission
+    /// already writing its markdown is allowed to finish that durable step.
+    public func stop() async {
+        acceptsSubmissions = false
+        let tasks = Array(submissionTasks.values)
+        for task in tasks { task.cancel() }
+        for task in tasks { await task.value }
+        submissionTasks.removeAll()
     }
 
     public func importPDF(at url: URL) async {

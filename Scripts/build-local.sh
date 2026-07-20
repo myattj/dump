@@ -71,6 +71,7 @@ check_environment() {
   require_command xcodebuild
   require_command xcodegen
   require_command xcrun
+  require_command codesign
 
   local developer_dir
   developer_dir="$(xcode-select -p 2>/dev/null || true)"
@@ -118,6 +119,7 @@ check_environment
 cd "$ROOT_DIR"
 
 run xcodegen generate
+run "$ROOT_DIR/Scripts/sync-swift-package-lock.sh" --install
 run "$ROOT_DIR/Scripts/fetch-runtime.sh"
 
 if [[ "$RUN_TESTS" == "1" ]]; then
@@ -138,6 +140,15 @@ run xcodebuild \
   -destination "$DESTINATION" \
   "CONFIGURATION_BUILD_DIR=$BUILD_DIR" \
   build
+# Xcode's unsigned Release build can leave the app and embedded frameworks with
+# incompatible hardened ad-hoc signatures. Re-sign the complete local bundle
+# without hardened runtime so it launches directly. Official releases are
+# signed again with Developer ID and hardened runtime by Scripts/sign.sh.
+run codesign --force --deep --sign - \
+  --entitlements "$ROOT_DIR/Resources/Dump.entitlements" \
+  "$APP_PATH"
+run codesign --verify --deep --strict "$APP_PATH"
+run "$ROOT_DIR/Scripts/sync-swift-package-lock.sh" --check
 
 if [[ "$DRY_RUN" != "1" ]]; then
   [[ -d "$APP_PATH" ]] || die "build completed but $APP_PATH was not created"

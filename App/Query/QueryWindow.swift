@@ -142,9 +142,11 @@ public final class QueryViewModel: ObservableObject {
     /// in flight), and a stale synthesis must not animate in over newer
     /// results.
     private var runToken = 0
-    /// The in-flight run, owned so reset() can cancel a stalled stream
-    /// promptly instead of waiting for the next delta to hit the token guard.
-    private var runHandle: Task<Void, Never>?
+    /// All current and retiring runs. Keeping cancelled predecessors until
+    /// they actually finish lets app shutdown join their provider processes
+    /// instead of losing the handle when a newer query replaces them.
+    private var runHandles: [UUID: Task<Void, Never>] = [:]
+    private var acceptsRuns = true
 
     private var reduceMotion: Bool {
         NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
@@ -156,11 +158,18 @@ public final class QueryViewModel: ObservableObject {
     }
 
     public func submitRun() {
-        runHandle?.cancel()
-        runHandle = Task { await self.run() }
+        guard acceptsRuns else { return }
+        for task in runHandles.values { task.cancel() }
+        let id = UUID()
+        runHandles[id] = Task { [weak self] in
+            guard let self else { return }
+            defer { self.runHandles.removeValue(forKey: id) }
+            await self.run()
+        }
     }
 
     public func run() async {
+        guard acceptsRuns, !Task.isCancelled else { return }
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
         runToken += 1
@@ -253,14 +262,13 @@ public final class QueryViewModel: ObservableObject {
     }
 
     public func reset() {
-        // Orphan any in-flight run: every post-await mutation in run() is
+        // Retire any in-flight run: every post-await mutation in run() is
         // guarded on `token == runToken`, so bumping it here keeps a late
         // synthesis from resurrecting an answer/error into the next open.
         // Cancel too — a stalled stream would otherwise hold its connection
         // (and the LLM generation) until the idle timeout.
         runToken += 1
-        runHandle?.cancel()
-        runHandle = nil
+        for task in runHandles.values { task.cancel() }
         query = ""
         lastRunQuery = ""
         hits = []
@@ -269,6 +277,19 @@ public final class QueryViewModel: ObservableObject {
         selection = nil
         isSynthesizing = false
         revealCascade = false
+    }
+
+    /// Terminal lifecycle shutdown: reject new queries, cancel all current
+    /// and superseded runs, and wait until their HTTP/provider work exits.
+    public func stop() async {
+        acceptsRuns = false
+        runToken += 1
+        let tasks = Array(runHandles.values)
+        for task in tasks { task.cancel() }
+        for task in tasks { await task.value }
+        runHandles.removeAll()
+        isLoading = false
+        isSynthesizing = false
     }
 
     /// User-driven promotion of a row to the primary slot (click). Routed

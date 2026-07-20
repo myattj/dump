@@ -12,7 +12,7 @@ Dump may store the following locally:
 
 - Captures, meeting notes, and extracted PDF text as Markdown under the storage root you choose. The default is `~/Dump`.
 - YAML frontmatter containing identifiers, timestamps, titles, tags, entry type, status, scheduling data, queue metadata, and source references.
-- A local qmd search index and derived embeddings under qmd's data directory, which Dump points at the selected storage root.
+- A local qmd search index, derived embeddings, model assets, and collection configuration under `<storage root>/.dump-qmd`.
 - Paths and index settings for code collections selected by you. Code folders are indexed in place rather than copied into Dump's content folders.
 - Provider selection, model names, endpoint URLs, hotkeys, window positions, and other preferences in macOS UserDefaults.
 - Anthropic and custom-provider API keys, plus AWS access credentials, in macOS Keychain. Keychain items are marked for this device and become accessible after the first unlock.
