@@ -12,7 +12,6 @@ xcuserdata/
 .swiftpm/
 .build/
 Packages/
-Package.resolved
 
 # Generated runtime artifacts (Phase 1+)
 Runtime/node/
@@ -32,6 +31,7 @@ Runtime/.work/
 # Local developer and agent tooling
 .agents/
 .claude/
+.gstack/
 skills-lock.json
 
 # Local configuration and signing credentials

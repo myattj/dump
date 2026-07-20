@@ -47,8 +47,8 @@ The workflow deliberately has no unsigned fallback. Missing or invalid credentia
    ```bash
    git switch main
    git pull --ff-only
-   git tag -a v0.1.3-b6 -m "Dump 0.1.3"
-   git push origin v0.1.3-b6
+   git tag -a v0.1.4-b7 -m "Dump 0.1.4"
+   git push origin v0.1.4-b7
    ```
 
 5. Open **Actions → Release DMG → Run workflow**, enter the tag, and start the release.
@@ -64,7 +64,7 @@ Stage the existing `appcast.xml` and new notarized DMG together, then run:
 ```bash
 RELEASE_DIR=/path/to/appcast-staging \
 APPCAST_URL=https://myattj.github.io/dump-updates/appcast.xml \
-DOWNLOAD_URL_PREFIX=https://github.com/myattj/dump/releases/download/v0.1.3-b6/ \
+DOWNLOAD_URL_PREFIX=https://github.com/myattj/dump/releases/download/v0.1.4-b7/ \
 GENERATE_APPCAST=/path/to/generate_appcast \
 ./Scripts/release-appcast.sh
 ```

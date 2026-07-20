@@ -163,3 +163,79 @@ final class QueryEngineTests: XCTestCase {
         XCTAssertNil(phrase)
     }
 }
+
+@MainActor
+final class QueryViewModelShutdownTests: XCTestCase {
+    func testReplacementResetAndStopJoinEverySynthesisRun() async {
+        let client = MockQMDClient()
+        client.stubHits([
+            QMDHit(
+                docid: "#shutdown",
+                file: "inbox/shutdown.md",
+                title: "Shutdown",
+                score: 1,
+                context: nil,
+                snippet: "provider lifecycle"
+            ),
+        ])
+        let synthesizer = CancellationRecordingSynthesizer()
+        let viewModel = QueryViewModel(
+            engine: QueryEngine(client: client),
+            synthesizer: synthesizer
+        )
+        viewModel.mode = .ask
+
+        viewModel.query = "first"
+        viewModel.submitRun()
+        await waitForStartedCount(1, synthesizer: synthesizer)
+
+        viewModel.query = "second"
+        viewModel.submitRun()
+        await waitForStartedCount(2, synthesizer: synthesizer)
+
+        viewModel.reset()
+        viewModel.query = "third"
+        viewModel.submitRun()
+        await waitForStartedCount(3, synthesizer: synthesizer)
+
+        await viewModel.stop()
+
+        let started = await synthesizer.startedCount()
+        let cancelled = await synthesizer.cancelledCount()
+        XCTAssertEqual(started, 3)
+        XCTAssertEqual(cancelled, 3)
+        XCTAssertFalse(viewModel.isLoading)
+        XCTAssertFalse(viewModel.isSynthesizing)
+    }
+
+    private func waitForStartedCount(
+        _ expected: Int,
+        synthesizer: CancellationRecordingSynthesizer
+    ) async {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while (await synthesizer.startedCount()) < expected, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        let actual = await synthesizer.startedCount()
+        XCTAssertEqual(actual, expected)
+    }
+}
+
+private actor CancellationRecordingSynthesizer: Synthesizing {
+    private var started = 0
+    private var cancelled = 0
+
+    func synthesize(query: String, hits: [QueryEngine.Hit]) async throws -> SynthesisResult {
+        started += 1
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch is CancellationError {
+            cancelled += 1
+            throw CancellationError()
+        }
+        return SynthesisResult(text: "unexpected", citations: [])
+    }
+
+    func startedCount() -> Int { started }
+    func cancelledCount() -> Int { cancelled }
+}

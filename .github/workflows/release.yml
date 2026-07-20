@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing version tag to build (for example, v0.1.3-b6)
+        description: Existing version tag to build (for example, v0.1.4-b7)
         required: true
         type: string
 

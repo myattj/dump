@@ -113,6 +113,43 @@ final class CaptureCoordinatorTests: XCTestCase {
         XCTAssertTrue(raw.contains("type: meeting"))
         XCTAssertTrue(raw.contains("source: meeting"))
     }
+
+    func testStopPreservesDurableCaptureAndJoinsClassification() async throws {
+        let blockingClassifier = CancellationRecordingCaptureClassifier()
+        let blockingHub = ClassifierHub(
+            keychain: KeychainStore(service: "cap.\(UUID())"),
+            defaults: UserDefaults(suiteName: "cap-hub.\(UUID())")!,
+            claude: blockingClassifier,
+            ollama: blockingClassifier
+        )
+        let coordinator = CaptureCoordinator(
+            storage: storage,
+            writer: MarkdownWriter(),
+            classifier: blockingHub,
+            scheduler: scheduler,
+            daemon: daemon,
+            queryEngine: queryEngine
+        )
+
+        coordinator.enqueueSubmission(body: "durable during shutdown", source: .capture)
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !(await blockingClassifier.hasStarted()), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        let didStart = await blockingClassifier.hasStarted()
+        XCTAssertTrue(didStart)
+
+        await coordinator.stop()
+
+        let wasCancelled = await blockingClassifier.wasCancelled()
+        XCTAssertTrue(wasCancelled)
+        let inbox = storage.subdirectory(.inbox)
+        let files = try FileManager.default.contentsOfDirectory(at: inbox, includingPropertiesForKeys: nil)
+        XCTAssertEqual(files.count, 1)
+        let raw = try String(contentsOf: files[0], encoding: .utf8)
+        XCTAssertTrue(raw.contains("durable during shutdown"))
+        XCTAssertTrue(qmdClient.cliCalls.isEmpty)
+    }
 }
 
 struct StubClassifier: Classifier {
@@ -128,4 +165,24 @@ struct ThrowingCaptureClassifier: Classifier {
     func classify(_ text: String, now: Date) async throws -> ClassifierResult {
         throw NSError(domain: "capture", code: 1)
     }
+}
+
+private actor CancellationRecordingCaptureClassifier: Classifier {
+    nonisolated let identifier = "blocking-capture"
+    private var started = false
+    private var cancelled = false
+
+    func classify(_ text: String, now: Date) async throws -> ClassifierResult {
+        started = true
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch is CancellationError {
+            cancelled = true
+            throw CancellationError()
+        }
+        return .unknown
+    }
+
+    func hasStarted() -> Bool { started }
+    func wasCancelled() -> Bool { cancelled }
 }

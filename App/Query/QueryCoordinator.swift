@@ -14,4 +14,8 @@ public final class QueryCoordinator {
     }
 
     public func show() { window.toggle() }
+
+    public func stop() async {
+        await viewModel.stop()
+    }
 }

@@ -6,6 +6,12 @@ import OSLog
 /// process, holds the chosen port, handles health probes and restart, and
 /// terminates only the process instance it launched.
 public actor QMDDaemonController {
+    typealias CLIExecutor = @Sendable (
+        _ executable: URL,
+        _ arguments: [String],
+        _ environment: [String: String]
+    ) async throws -> QMDCLIOutput
+
     public struct Config: Sendable {
         public var runtimeDirectory: URL?
         public var portRange: ClosedRange<Int>
@@ -39,6 +45,7 @@ public actor QMDDaemonController {
     private let process: ProcessLaunching
     private let transport: HTTPTransporting
     private let storage: StoragePreference
+    private let cliExecutor: CLIExecutor
     private let log = Logger(subsystem: "com.joshmyatt.dump", category: "qmd")
 
     private var state: State = .stopped
@@ -46,6 +53,8 @@ public actor QMDDaemonController {
     private var ringBuffer: [String] = []
     private var restartAttempts = 0
     private var launchGeneration: UInt = 0
+    private var acceptsCLIWork = true
+    private var activeCLITasks: [UUID: Task<QMDCLIOutput, Error>] = [:]
 
     public init(
         config: Config = Config(),
@@ -57,6 +66,27 @@ public actor QMDDaemonController {
         self.process = process
         self.transport = transport
         self.storage = storage
+        self.cliExecutor = { executable, arguments, environment in
+            try await QMDCLIProcessRunner(
+                executable: executable,
+                arguments: arguments,
+                environment: environment
+            ).run()
+        }
+    }
+
+    init(
+        config: Config = Config(),
+        process: ProcessLaunching = SystemProcessLauncher(),
+        transport: HTTPTransporting = HTTPTransport(),
+        storage: StoragePreference = .shared,
+        cliExecutor: @escaping CLIExecutor
+    ) {
+        self.config = config
+        self.process = process
+        self.transport = transport
+        self.storage = storage
+        self.cliExecutor = cliExecutor
     }
 
     public func currentState() -> State { state }
@@ -75,8 +105,54 @@ public actor QMDDaemonController {
 
     /// Environment passed to qmd CLI subprocesses so they read/write the same
     /// data directory as the long-running daemon.
-    public func cliEnvironment() -> [String: String] {
-        ["QMD_DATA_DIR": storage.root.path]
+    public func cliEnvironment() throws -> [String: String] {
+        let qmdRoot = storage.root.appendingPathComponent(".dump-qmd", isDirectory: true)
+        let cacheDirectory = qmdRoot.appendingPathComponent("qmd", isDirectory: true)
+        let configDirectory = qmdRoot.appendingPathComponent("config", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: cacheDirectory,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: configDirectory,
+            withIntermediateDirectories: true
+        )
+        return [
+            // qmd appends `qmd/index.sqlite` (and its model cache) here.
+            "XDG_CACHE_HOME": qmdRoot.path,
+            // Pin the database explicitly so an inherited INDEX_PATH cannot
+            // redirect Dump into another qmd installation's index.
+            "INDEX_PATH": cacheDirectory.appendingPathComponent("index.sqlite").path,
+            // qmd writes its collection YAML directly into this directory.
+            "QMD_CONFIG_DIR": configDirectory.path,
+        ]
+    }
+
+    /// Runs every qmd write-side command through one owner so shutdown can
+    /// reject new work, cancel every exact child, and wait for their exits.
+    public func runCLI(arguments: [String]) async throws -> QMDCLIOutput {
+        guard acceptsCLIWork else { throw CancellationError() }
+        try Task.checkCancellation()
+
+        var environment = ProcessInfo.processInfo.environment
+        for (key, value) in try cliEnvironment() {
+            environment[key] = value
+        }
+        let executable = nodeURL()
+        let commandArguments = [qmdEntryURL().path] + arguments
+        let executor = cliExecutor
+        let task = Task {
+            try await executor(executable, commandArguments, environment)
+        }
+        let id = UUID()
+        activeCLITasks[id] = task
+        defer { activeCLITasks.removeValue(forKey: id) }
+
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     public func startIfNeeded() async {
@@ -86,6 +162,7 @@ public actor QMDDaemonController {
 
     public func start() async {
         guard !Task.isCancelled else { return }
+        acceptsCLIWork = true
         launchGeneration &+= 1
         let generation = launchGeneration
         state = .starting
@@ -94,12 +171,9 @@ public actor QMDDaemonController {
         DiagnosticLog.event(.info, category: "qmd", "starting daemon", metadata: [
             "port": String(chosen),
         ])
-        let env = [
-            "QMD_PORT": String(chosen),
-            "QMD_DATA_DIR": storage.root.path,
-        ]
         do {
             try Task.checkCancellation()
+            let env = try cliEnvironment()
             try process.launch(
                 executable: nodeURL(),
                 arguments: [qmdEntryURL().path, "mcp", "--http", "--port", String(chosen)],
@@ -144,10 +218,17 @@ public actor QMDDaemonController {
         DiagnosticLog.event(.info, category: "qmd", "stopping daemon", metadata: [
             "port": port.map(String.init) ?? "",
         ])
+        acceptsCLIWork = false
+        let cliTasks = Array(activeCLITasks.values)
+        activeCLITasks.removeAll()
+        for task in cliTasks { task.cancel() }
         launchGeneration &+= 1
         process.terminate()
         state = .stopped
         port = nil
+        for task in cliTasks {
+            _ = await task.result
+        }
     }
 
     public func restart() async {

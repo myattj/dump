@@ -40,21 +40,32 @@ public extension Synthesizing {
     /// One-shot fallback wrapping the buffered call, so backends (and test
     /// fakes) adopt true token streaming incrementally.
     func synthesizeStream(query: String, hits: [QueryEngine.Hit]) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    let result = try await synthesize(query: query, hits: hits)
-                    // An empty yield would read as a "first token" upstream
-                    // and animate in an empty answer card.
-                    if !result.text.isEmpty {
-                        continuation.yield(result.text)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
+        let state = OneShotSynthesisStreamState()
+        return AsyncThrowingStream(unfolding: {
+            try Task.checkCancellation()
+            guard state.claim() else { return nil }
+            // `unfolding` executes in the consumer's task. Cancellation now
+            // propagates structurally into buffered backends (notably the
+            // Codex/Claude CLI runner), and joining the query task also joins
+            // the provider process instead of merely cancelling a hidden
+            // producer task.
+            let result = try await synthesize(query: query, hits: hits)
+            // An empty element would read as a "first token" upstream and
+            // animate in an empty answer card.
+            return result.text.isEmpty ? nil : result.text
+        })
+    }
+}
+
+private final class OneShotSynthesisStreamState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.withLock {
+            guard !claimed else { return false }
+            claimed = true
+            return true
         }
     }
 }

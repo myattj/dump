@@ -30,15 +30,29 @@ brew install xcodegen
 ./Scripts/build-local.sh --open
 ```
 
-`project.yml` is the Xcode project source of truth. Do not commit generated `Dump.xcodeproj` content.
+`project.yml` is the Xcode project source of truth. Do not commit generated `Dump.xcodeproj` content. The root `Package.resolved` is tracked separately; build and release scripts copy it into the generated workspace and fail if Xcode resolves different revisions.
+
+When intentionally changing Swift packages, regenerate the project, install the current lock, resolve dependencies, review the generated lock, and promote it back to the tracked root:
+
+```bash
+xcodegen generate
+./Scripts/sync-swift-package-lock.sh --install
+xcodebuild -resolvePackageDependencies -project Dump.xcodeproj -scheme Dump
+./Scripts/sync-swift-package-lock.sh --update
+git diff -- Package.resolved
+```
 
 ## Run the tests
 
 ```bash
 ./Scripts/build-local.sh --test
+./Scripts/test-app-storage-isolation.sh --app build/local/Dump.app
+./Scripts/test-qmd-integration.sh --app build/local/Dump.app --skip-embed
 ```
 
-CI runs the full test suite on an Apple-silicon macOS runner. A pull request should pass the local test command without signing or notarization credentials.
+The first command runs the Swift test suite and builds the same Release app a consumer runs. The second launches that app with a disposable profile to verify clean qmd storage setup and graceful qmd process cleanup. The third exercises the bundled Node/qmd runtime through a disposable collection and real MCP search. Neither smoke test downloads models or touches your normal Dump/qmd state. To include the embedding path when its model is already cached, replace `--skip-embed` with `--require-embed`.
+
+CI runs all three checks on an Apple-silicon macOS runner. A pull request should pass them without signing or notarization credentials.
 
 ## Make a change
 

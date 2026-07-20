@@ -56,7 +56,8 @@ public final class AppCoordinator: ObservableObject {
             storage: storage,
             writer: writer,
             classifier: classifierHub,
-            scheduler: scheduler
+            scheduler: scheduler,
+            queryEngine: QueryEngine(daemon: daemon, storage: storage)
         )
         self.queue = queue
 
@@ -272,9 +273,18 @@ public final class AppCoordinator: ObservableObject {
             NotificationCenter.default.removeObserver(dayChangeObserver)
             self.dayChangeObserver = nil
         }
+        // Provider-backed capture classification and Ask synthesis are not
+        // owned by qmd, so cancel and join them explicitly before the final
+        // daemon teardown. Capture preserves any markdown write in progress.
+        await capture.stop()
+        await query.stop()
+        await queue.stop()
+        // The daemon owns every qmd CLI child, including work started from
+        // capture, PDF import, settings, bootstrap, and the queue. Stop it
+        // before waiting for those callers so no untracked child can survive.
+        await daemon.stop()
         if let startup { await startup.value }
         if let transition { await transition.value }
-        await daemon.stop()
     }
 
     public func setStorageRoot(_ url: URL) {

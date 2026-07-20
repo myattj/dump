@@ -77,10 +77,13 @@ The default storage root is `~/Dump`. You can choose another folder in Settings.
 ~/Dump/
 ├── inbox/       # captures, tasks, and reminders
 ├── meetings/    # meeting notes
-└── pdfs/        # extracted PDF text, one Markdown file per readable page
+├── pdfs/        # extracted PDF text, one Markdown file per readable page
+└── .dump-qmd/   # generated local search index, models, and qmd configuration
 ```
 
-Each file contains a stable ID, timestamps, status, source, tags, and any available scheduling or queue metadata. The body remains plain text Markdown.
+Each Markdown entry contains a stable ID, timestamps, status, source, tags, and any available scheduling or queue metadata. The body remains plain text Markdown.
+
+`.dump-qmd` is generated search state rather than note content. It can be rebuilt from the source folders. With the currently bundled qmd version, first use may download about 1 GB of local embedding and reranking model assets into this hidden directory, so the initial index and first semantic search can take longer than later searches.
 
 PDF import extracts text that is already present in the document. Dump does not perform OCR, and it does not copy the original PDF into the storage root. Code collections are indexed from their selected folders rather than copied into Dump.
 
@@ -126,11 +129,13 @@ Local builds are ad-hoc signed for development. They are not official releases a
 
 ```bash
 ./Scripts/build-local.sh --test
+./Scripts/test-app-storage-isolation.sh --app build/local/Dump.app
+./Scripts/test-qmd-integration.sh --app build/local/Dump.app --skip-embed
 ```
 
-The `--test` option runs the unit tests before creating the Release build. It can be combined with `--open`.
+The first command runs the unit tests before creating the Release build and can be combined with `--open`. The second launches that app from a clean profile, verifies its qmd storage isolation, and confirms graceful qmd child-process cleanup. The third runs an isolated collection-to-MCP-search smoke test against the exact Node/qmd runtime inside the app. Neither smoke test modifies your normal Dump/qmd state or downloads model files; contributors with a cached embedding model can use `--require-embed` instead of `--skip-embed` for the embedding path.
 
-`project.yml` is the source of truth for the Xcode project. `Dump.xcodeproj`, the downloaded Node runtime, qmd's installed packages, and build output are generated locally and intentionally ignored by Git.
+`project.yml` is the source of truth for the Xcode project. `Package.resolved` locks the Swift package revisions used by source and release builds. `Dump.xcodeproj`, the downloaded Node runtime, qmd's installed packages, and build output are generated locally and intentionally ignored by Git.
 
 To work in Xcode after generation:
 

@@ -5,7 +5,7 @@ import SwiftUI
 /// Enter — classification and indexing happen after the window is gone.
 @MainActor
 public final class CaptureWindowController {
-    public typealias Submit = @MainActor (String) async -> Void
+    public typealias Submit = @MainActor (String) -> Void
 
     private var panel: NSPanel?
     // `isShowing` tracks user *intent* and is updated synchronously. Don't
@@ -364,7 +364,7 @@ struct CaptureView: View {
         // visibly lifts away as "sent". It clears on the next presentation.
         clearOnNextPresent = true
         onCommitClose()
-        Task { await onSubmit(body) }
+        onSubmit(body)
     }
 }
 

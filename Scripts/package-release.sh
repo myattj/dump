@@ -167,6 +167,7 @@ if [[ "$RUN_XCODEGEN" == "1" ]]; then
   fi
 fi
 
+run "$ROOT_DIR/Scripts/sync-swift-package-lock.sh" --install
 run "$ROOT_DIR/Scripts/fetch-runtime.sh"
 
 if [[ "$RUN_TESTS" == "1" ]]; then
@@ -193,6 +194,7 @@ fi
 build_args+=(build)
 
 run "${build_args[@]}"
+run "$ROOT_DIR/Scripts/sync-swift-package-lock.sh" --check
 
 APP_PATH="$DERIVED_DATA_PATH/Build/Products/$CONFIGURATION/$SCHEME.app"
 

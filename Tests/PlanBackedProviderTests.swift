@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import Dump
@@ -174,6 +175,80 @@ final class SystemLocalPlanCommandRunnerTests: XCTestCase {
         XCTAssertEqual(result.exitCode, 0)
         XCTAssertTrue(result.stdout.contains("stdout-4999"))
         XCTAssertTrue(result.stderr.contains("stderr-4999"))
+    }
+
+    func testCancellationTerminatesAndJoinsExactOwnedProcess() async throws {
+        let invocation = LocalPlanProcessInvocation(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "trap '' TERM; /bin/sleep 30; while :; do :; done"],
+            environment: ProcessInfo.processInfo.environment,
+            standardInput: nil,
+            timeout: 30
+        )
+        let task = Task { try await invocation.run() }
+
+        let launchDeadline = ContinuousClock.now + .seconds(2)
+        var pid: pid_t?
+        while pid == nil, ContinuousClock.now < launchDeadline {
+            pid = invocation.runningProcessIdentifier()
+            if pid == nil { try? await Task.sleep(for: .milliseconds(20)) }
+        }
+        let ownedPID = try XCTUnwrap(pid)
+        var descendantPIDs: [pid_t] = []
+        while descendantPIDs.isEmpty, ContinuousClock.now < launchDeadline {
+            descendantPIDs = invocation.runningDescendantProcessIdentifiers()
+            if descendantPIDs.isEmpty { try? await Task.sleep(for: .milliseconds(20)) }
+        }
+        XCTAssertFalse(descendantPIDs.isEmpty, "provider fixture did not launch its helper child")
+        // Give the shell time to install its TERM handler so this also
+        // exercises the verified SIGKILL fallback.
+        try await Task.sleep(for: .milliseconds(100))
+
+        let started = ContinuousClock.now
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+
+        XCTAssertLessThan(ContinuousClock.now - started, .seconds(3))
+        XCTAssertEqual(Darwin.kill(ownedPID, 0), -1, "owned provider child survived cancellation")
+        for descendantPID in descendantPIDs {
+            XCTAssertEqual(
+                Darwin.kill(descendantPID, 0),
+                -1,
+                "owned provider descendant \(descendantPID) survived cancellation"
+            )
+        }
+    }
+
+    func testCancellationBeforeLaunchCreatesNoChildSideEffect() async {
+        let marker = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dump-cancel-before-launch-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: marker) }
+        let invocation = LocalPlanProcessInvocation(
+            executable: URL(fileURLWithPath: "/usr/bin/touch"),
+            arguments: [marker.path],
+            environment: ProcessInfo.processInfo.environment,
+            standardInput: nil,
+            timeout: 5
+        )
+
+        invocation.cancel()
+        do {
+            _ = try await invocation.run()
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("wrong error: \(error)")
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
     }
 }
 

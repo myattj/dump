@@ -98,28 +98,88 @@ public final class SystemLocalPlanCommandRunner: LocalPlanCommandRunning, @unche
         standardInput: Data?,
         timeout: TimeInterval
     ) async throws -> LocalPlanCommandResult {
-        try await Task.detached(priority: .utility) {
-            try Self.runSync(
-                executable: executable,
-                arguments: arguments,
-                environment: environment,
-                standardInput: standardInput,
-                timeout: timeout
-            )
-        }.value
+        try await LocalPlanProcessInvocation(
+            executable: executable,
+            arguments: arguments,
+            environment: Self.mergedEnvironment(environment),
+            standardInput: standardInput,
+            timeout: timeout
+        ).run()
     }
 
-    private static func runSync(
+    private static func mergedEnvironment(_ overrides: [String: String]) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        let fallbackPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        if let path = environment["PATH"], !path.isEmpty {
+            environment["PATH"] = "\(fallbackPath):\(path)"
+        } else {
+            environment["PATH"] = fallbackPath
+        }
+        for (key, value) in overrides {
+            environment[key] = value
+        }
+        return environment
+    }
+}
+
+/// Owns one provider CLI invocation. Cancellation always targets the exact
+/// `Process` this instance launched, waits for it to exit, and reports
+/// `CancellationError` to the caller instead of leaving a 90/120-second CLI
+/// behind during app termination.
+final class LocalPlanProcessInvocation: @unchecked Sendable {
+    private let executable: URL
+    private let arguments: [String]
+    private let environment: [String: String]
+    private let standardInput: Data?
+    private let timeout: TimeInterval
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    init(
         executable: URL,
         arguments: [String],
         environment: [String: String],
         standardInput: Data?,
         timeout: TimeInterval
-    ) throws -> LocalPlanCommandResult {
+    ) {
+        self.executable = executable
+        self.arguments = arguments
+        self.environment = environment
+        self.standardInput = standardInput
+        self.timeout = timeout
+    }
+
+    func run() async throws -> LocalPlanCommandResult {
+        let result = try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await Task.detached(priority: .utility) {
+                try self.runSynchronously()
+            }.value
+        } onCancel: {
+            self.cancel()
+        }
+        try Task.checkCancellation()
+        return result
+    }
+
+    func runningProcessIdentifier() -> pid_t? {
+        lock.withLock {
+            guard let process, process.isRunning else { return nil }
+            return process.processIdentifier
+        }
+    }
+
+    func runningDescendantProcessIdentifiers() -> [pid_t] {
+        guard let pid = runningProcessIdentifier() else { return [] }
+        return Self.descendantProcessIdentifiers(of: pid)
+    }
+
+    private func runSynchronously() throws -> LocalPlanCommandResult {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
-        process.environment = mergedEnvironment(environment)
+        process.environment = environment
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -137,39 +197,113 @@ public final class SystemLocalPlanCommandRunner: LocalPlanCommandRunning, @unche
         process.standardInput = inputHandle
 
         let deadline = Date().addingTimeInterval(timeout)
-        try process.run()
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            throw CancellationError()
+        }
+        self.process = process
+        do {
+            // Keep the lock across launch so cancellation cannot slip between
+            // the preflight check and a child becoming live but unowned.
+            try process.run()
+        } catch {
+            self.process = nil
+            lock.unlock()
+            throw error
+        }
+        lock.unlock()
+
         while process.isRunning && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.05)
         }
 
         if process.isRunning {
+            // Provider CLIs can launch helpers that inherit our stdout/stderr
+            // pipes. Kill descendants first so one cannot keep pipe EOF open
+            // after the root exits and make shutdown wait forever.
+            Self.forceTerminateDescendants(of: process.processIdentifier)
             process.terminate()
             Thread.sleep(forTimeInterval: 0.25)
             if process.isRunning {
+                Self.forceTerminateDescendants(of: process.processIdentifier)
                 kill(process.processIdentifier, SIGKILL)
             }
         }
         process.waitUntilExit()
 
-        return LocalPlanCommandResult(
+        let result = LocalPlanCommandResult(
             stdout: String(data: stdoutCollector.finish(), encoding: .utf8) ?? "",
             stderr: String(data: stderrCollector.finish(), encoding: .utf8) ?? "",
             exitCode: process.terminationStatus
         )
+        let wasCancelled = lock.withLock {
+            if self.process === process { self.process = nil }
+            return cancelled
+        }
+        if wasCancelled { throw CancellationError() }
+        return result
     }
 
-    private static func mergedEnvironment(_ overrides: [String: String]) -> [String: String] {
-        var environment = ProcessInfo.processInfo.environment
-        let fallbackPath = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        if let path = environment["PATH"], !path.isEmpty {
-            environment["PATH"] = "\(fallbackPath):\(path)"
-        } else {
-            environment["PATH"] = fallbackPath
+    func cancel() {
+        let process = lock.withLock { () -> Process? in
+            cancelled = true
+            return self.process
         }
-        for (key, value) in overrides {
-            environment[key] = value
+        guard let process, process.isRunning else { return }
+        let pid = process.processIdentifier
+        Self.forceTerminateDescendants(of: pid)
+        process.terminate()
+        Self.forceTerminateDescendants(of: pid)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.forceTerminateIfRunning(pid: pid)
         }
-        return environment
+    }
+
+    private func forceTerminateIfRunning(pid: pid_t) {
+        let ownedProcess = lock.withLock { () -> Process? in
+            guard let process, process.processIdentifier == pid else { return nil }
+            return process
+        }
+        if let ownedProcess, ownedProcess.isRunning {
+            Self.forceTerminateDescendants(of: pid)
+            Darwin.kill(pid, SIGKILL)
+        }
+    }
+
+    private static func forceTerminateDescendants(of rootPID: pid_t) {
+        for pid in descendantProcessIdentifiers(of: rootPID).reversed() where pid > 1 {
+            Darwin.kill(pid, SIGKILL)
+        }
+    }
+
+    private static func descendantProcessIdentifiers(of rootPID: pid_t) -> [pid_t] {
+        var descendants: [pid_t] = []
+        var pending = [rootPID]
+        var seen = Set([rootPID])
+
+        while let parent = pending.popLast() {
+            for child in directChildProcessIdentifiers(of: parent)
+            where child > 1 && seen.insert(child).inserted {
+                descendants.append(child)
+                pending.append(child)
+            }
+        }
+        return descendants
+    }
+
+    private static func directChildProcessIdentifiers(of parentPID: pid_t) -> [pid_t] {
+        let hint = proc_listchildpids(parentPID, nil, 0)
+        guard hint > 0 else { return [] }
+        // The sizing call is deliberately generous on macOS and the buffered
+        // call returns a PID count (not a byte count). Allocate at least the
+        // full hint so a wide provider process tree cannot be truncated.
+        var pids = [pid_t](repeating: 0, count: max(Int(hint), 32))
+        let count = pids.withUnsafeMutableBytes { buffer in
+            proc_listchildpids(parentPID, buffer.baseAddress, Int32(buffer.count))
+        }
+        guard count > 0 else { return [] }
+        return Array(pids.prefix(min(Int(count), pids.count)))
     }
 
     private static func makeStandardInputHandle(_ data: Data) throws -> FileHandle {

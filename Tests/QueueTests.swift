@@ -436,6 +436,8 @@ final class QueueViewModelSelectionTests: XCTestCase {
     var writer: MarkdownWriter!
     var notifications: MockNotificationCenter!
     var scheduler: SchedulerService!
+    var qmdClient: MockQMDClient!
+    var classifierHub: ClassifierHub!
     var viewModel: QueueViewModel!
 
     // Xcode 16 declares XCTest's async base hook as nonisolated, so an
@@ -448,9 +450,10 @@ final class QueueViewModelSelectionTests: XCTestCase {
         writer = MarkdownWriter()
         notifications = MockNotificationCenter()
         scheduler = SchedulerService(storage: storage, writer: writer, notifications: notifications)
+        qmdClient = MockQMDClient()
         try FileManager.default.createDirectory(at: storage.subdirectory(.inbox), withIntermediateDirectories: true)
 
-        let classifier = ClassifierHub(
+        classifierHub = ClassifierHub(
             keychain: KeychainStore(service: "queue.vm.\(UUID())"),
             defaults: UserDefaults(suiteName: "queue.vm.hub.\(UUID())")!,
             claude: QueueViewModelNoopClassifier(),
@@ -462,16 +465,20 @@ final class QueueViewModelSelectionTests: XCTestCase {
         viewModel = QueueViewModel(
             storage: storage,
             writer: writer,
-            classifier: classifier,
+            classifier: classifierHub,
             scheduler: scheduler,
-            store: store
+            store: store,
+            queryEngine: QueryEngine(client: qmdClient, storage: storage)
         )
     }
 
     // See setUp(): the XCTest base implementation has no work to preserve.
     override func tearDown() async throws {
+        await viewModel?.stop()
         try? FileManager.default.removeItem(at: tempRoot)
         viewModel = nil
+        classifierHub = nil
+        qmdClient = nil
         scheduler = nil
         notifications = nil
         writer = nil
@@ -531,6 +538,157 @@ final class QueueViewModelSelectionTests: XCTestCase {
         XCTAssertNotNil(viewModel.error)
     }
 
+    func testSubmitRequestsSearchIndexUpdate() async {
+        viewModel.input = "write launch notes"
+
+        await viewModel.submit(now: Date(timeIntervalSince1970: 1_800_000_000))
+
+        await assertIndexingRequested()
+    }
+
+    func testMetadataEditRequestsSearchIndexUpdate() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        try writeTask(id: "edit", title: "Edit me", deadlineAt: now.addingTimeInterval(3_600), createdAt: now)
+        await viewModel.refresh(now: now)
+
+        await viewModel.setImportance(try XCTUnwrap(viewModel.items.first), to: 4)
+
+        await assertIndexingRequested()
+    }
+
+    func testCompleteRequestsSearchIndexUpdate() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        try writeTask(id: "complete", title: "Complete me", deadlineAt: now.addingTimeInterval(3_600), createdAt: now)
+        await viewModel.refresh(now: now)
+
+        await viewModel.complete(try XCTUnwrap(viewModel.items.first))
+
+        await assertIndexingRequested()
+    }
+
+    func testSnoozeRequestsSearchIndexUpdate() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        try writeTask(id: "snooze", title: "Snooze me", deadlineAt: now.addingTimeInterval(3_600), createdAt: now)
+        await viewModel.refresh(now: now)
+
+        await viewModel.snooze(try XCTUnwrap(viewModel.items.first), .tomorrow, now: now)
+
+        await assertIndexingRequested()
+    }
+
+    func testExternalMutationRefreshRequestsSearchIndexUpdate() async {
+        await viewModel.refreshAfterExternalMutation()
+
+        await assertIndexingRequested()
+    }
+
+    func testStopIndexingCancelsAndAwaitsActiveCLIWork() async {
+        let blockingClient = BlockingQueueQMDClient()
+        let blockingViewModel = QueueViewModel(
+            storage: storage,
+            writer: writer,
+            classifier: classifierHub,
+            scheduler: scheduler,
+            store: QueueStore(storage: storage, writer: writer, scheduler: scheduler),
+            queryEngine: QueryEngine(client: blockingClient, storage: storage)
+        )
+
+        await blockingViewModel.refreshAfterExternalMutation()
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !(await blockingClient.hasStarted()), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        guard await blockingClient.hasStarted() else {
+            await blockingViewModel.stopIndexing()
+            XCTFail("queue index update did not start before timeout")
+            return
+        }
+        await blockingViewModel.stopIndexing()
+
+        let calls = await blockingClient.calls()
+        let wasCancelled = await blockingClient.wasCancelled()
+        XCTAssertEqual(calls, [["update"]])
+        XCTAssertTrue(wasCancelled)
+    }
+
+    func testStopIndexingCancelsPendingDebouncedWork() async {
+        await viewModel.refreshAfterExternalMutation()
+
+        await viewModel.stopIndexing()
+
+        XCTAssertTrue(qmdClient.cliCalls.isEmpty)
+    }
+
+    func testStopCancelsAndJoinsEveryClassificationAndRejectsLateSubmit() async throws {
+        let blockingClassifier = CancellationRecordingQueueClassifier()
+        let blockingHub = ClassifierHub(
+            keychain: KeychainStore(service: "queue.stop.\(UUID())"),
+            defaults: UserDefaults(suiteName: "queue.stop.hub.\(UUID())")!,
+            claude: blockingClassifier,
+            ollama: blockingClassifier
+        )
+        let stoppingViewModel = QueueViewModel(
+            storage: storage,
+            writer: writer,
+            classifier: blockingHub,
+            scheduler: scheduler,
+            store: QueueStore(storage: storage, writer: writer, scheduler: scheduler),
+            queryEngine: QueryEngine(client: qmdClient, storage: storage)
+        )
+
+        stoppingViewModel.input = "first shutdown classification"
+        await stoppingViewModel.submit()
+        stoppingViewModel.input = "second shutdown classification"
+        await stoppingViewModel.submit()
+
+        let deadline = ContinuousClock.now + .seconds(2)
+        while (await blockingClassifier.startedCount()) < 2, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        let startedBeforeStop = await blockingClassifier.startedCount()
+        XCTAssertEqual(startedBeforeStop, 2)
+
+        await stoppingViewModel.stop()
+
+        let cancelled = await blockingClassifier.cancelledCount()
+        XCTAssertEqual(cancelled, 2)
+        stoppingViewModel.input = "must not start after stop"
+        await stoppingViewModel.submit()
+        let startedAfterStop = await blockingClassifier.startedCount()
+        XCTAssertEqual(startedAfterStop, 2)
+
+        let files = try FileManager.default.contentsOfDirectory(
+            at: storage.subdirectory(.inbox),
+            includingPropertiesForKeys: nil
+        )
+        XCTAssertEqual(files.count, 2, "both queue drafts must be durable before classification")
+    }
+
+    func testIndexingRetriesUpdateAndEmbedIndependently() async {
+        let retryingClient = TransientQueueQMDClient(
+            updateFailures: 1,
+            embedFailures: 1
+        )
+        let retryingViewModel = QueueViewModel(
+            storage: storage,
+            writer: writer,
+            classifier: classifierHub,
+            scheduler: scheduler,
+            store: QueueStore(storage: storage, writer: writer, scheduler: scheduler),
+            queryEngine: QueryEngine(client: retryingClient, storage: storage)
+        )
+
+        await retryingViewModel.refreshAfterExternalMutation()
+        let deadline = ContinuousClock.now + .seconds(3)
+        while (await retryingClient.calls()).count < 4, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        await retryingViewModel.stopIndexing()
+
+        let calls = await retryingClient.calls()
+        XCTAssertEqual(calls, [["update"], ["update"], ["embed"], ["embed"]])
+    }
+
     @discardableResult
     private func writeTask(
         id: String,
@@ -546,6 +704,22 @@ final class QueueViewModelSelectionTests: XCTestCase {
             fm.deadlineAt = deadlineAt
         }
     }
+
+    private func assertIndexingRequested(
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while qmdClient.cliCalls.count < 2, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(
+            Array(qmdClient.cliCalls.prefix(2)),
+            [["update"], ["embed"]],
+            file: file,
+            line: line
+        )
+    }
 }
 
 private struct QueueViewModelNoopClassifier: Classifier {
@@ -554,6 +728,94 @@ private struct QueueViewModelNoopClassifier: Classifier {
     func classify(_ text: String, now: Date) async throws -> ClassifierResult {
         .unknown
     }
+}
+
+private actor CancellationRecordingQueueClassifier: Classifier {
+    nonisolated let identifier = "blocking-queue"
+    private var started = 0
+    private var cancelled = 0
+
+    func classify(_ text: String, now: Date) async throws -> ClassifierResult {
+        started += 1
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch is CancellationError {
+            cancelled += 1
+            throw CancellationError()
+        }
+        return .unknown
+    }
+
+    func startedCount() -> Int { started }
+    func cancelledCount() -> Int { cancelled }
+}
+
+private actor BlockingQueueQMDClient: QMDClienting {
+    private var cliCalls: [[String]] = []
+    private var cliStarted = false
+    private var cliCancelled = false
+
+    func query(_ q: QMDQuery) async throws -> [QMDHit] { [] }
+
+    func get(file: String, fromLine: Int?, maxLines: Int?) async throws -> String { "" }
+
+    func status() async throws -> QMDStatus {
+        QMDStatus(totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: false, collections: [])
+    }
+
+    func runCLI(arguments: [String]) async throws -> QMDCLIOutput {
+        cliCalls.append(arguments)
+        cliStarted = true
+        do {
+            try await Task.sleep(for: .seconds(30))
+        } catch is CancellationError {
+            cliCancelled = true
+            throw CancellationError()
+        }
+        return QMDCLIOutput(exitCode: 0, stdout: "", stderr: "")
+    }
+
+    func hasStarted() -> Bool { cliStarted }
+    func calls() -> [[String]] { cliCalls }
+    func wasCancelled() -> Bool { cliCancelled }
+}
+
+private actor TransientQueueQMDClient: QMDClienting {
+    private var updateFailures: Int
+    private var embedFailures: Int
+    private var cliCalls: [[String]] = []
+
+    init(updateFailures: Int, embedFailures: Int) {
+        self.updateFailures = updateFailures
+        self.embedFailures = embedFailures
+    }
+
+    func query(_ q: QMDQuery) async throws -> [QMDHit] { [] }
+
+    func get(file: String, fromLine: Int?, maxLines: Int?) async throws -> String { "" }
+
+    func status() async throws -> QMDStatus {
+        QMDStatus(totalDocuments: 0, needsEmbedding: 0, hasVectorIndex: false, collections: [])
+    }
+
+    func runCLI(arguments: [String]) async throws -> QMDCLIOutput {
+        cliCalls.append(arguments)
+        if arguments == ["update"], updateFailures > 0 {
+            updateFailures -= 1
+            throw TransientQueueQMDClientError.expectedFailure
+        }
+        if arguments == ["embed"], embedFailures > 0 {
+            embedFailures -= 1
+            throw TransientQueueQMDClientError.expectedFailure
+        }
+        return QMDCLIOutput(exitCode: 0, stdout: "", stderr: "")
+    }
+
+    func calls() -> [[String]] { cliCalls }
+}
+
+private enum TransientQueueQMDClientError: Error {
+    case expectedFailure
 }
 
 final class QueueSummaryTests: XCTestCase {
